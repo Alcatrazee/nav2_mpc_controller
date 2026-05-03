@@ -9,12 +9,13 @@ namespace nav2_mpc_controller
 
 void MPCController::configure(
   const rclcpp_lifecycle::LifecycleNode::WeakPtr & parent,
-  std::string name, std::shared_ptr<tf2_ros::Buffer> /*tf*/,
+  std::string name, std::shared_ptr<tf2_ros::Buffer> tf,
   std::shared_ptr<nav2_costmap_2d::Costmap2DROS> costmap_ros)
 {
   auto node = parent.lock();
   node_ = parent;
   plugin_name_ = name;
+  tf_ = tf;
   costmap_ros_ = costmap_ros;
   logger_ = node->get_logger();
 
@@ -44,27 +45,40 @@ void MPCController::configure(
   node->get_parameter(plugin_name_ + ".r_v", r_v_);
   node->get_parameter(plugin_name_ + ".r_w", r_w_);
 
+  // 注册动态参数回调
+  dyn_params_handler_ = node->add_on_set_parameters_callback(
+    std::bind(&MPCController::dynamicParametersCallback, this, std::placeholders::_1));
+
   // 创建预测轨迹的发布器
-  traj_pub_ = node->create_publisher<nav_msgs::msg::Path>("predict_trajectory", 1);
+  traj_pub_ = node->create_publisher<nav_msgs::msg::Path>("predict_trajectory", 10);
+  transformed_plan_pub_ = node->create_publisher<nav_msgs::msg::Path>("transformed_global_plan", 10);
+  transformed_local_plan_pub_ = node->create_publisher<nav_msgs::msg::Path>("transformed_local_plan", 10);
 
   RCLCPP_INFO(logger_, "MPC Controller Configured.");
 }
 
 void MPCController::cleanup()
 {
+  dyn_params_handler_.reset();
   traj_pub_.reset();
+  transformed_plan_pub_.reset();
+  transformed_local_plan_pub_.reset();
   RCLCPP_INFO(logger_, "MPC Controller Cleaned Up.");
 }
 
 void MPCController::activate()
 {
   traj_pub_->on_activate();
+  transformed_plan_pub_->on_activate();
+  transformed_local_plan_pub_->on_activate();
   RCLCPP_INFO(logger_, "MPC Controller Activated.");
 }
 
 void MPCController::deactivate()
 {
   traj_pub_->on_deactivate();
+  transformed_plan_pub_->on_deactivate();
+  transformed_local_plan_pub_->on_deactivate();
   RCLCPP_INFO(logger_, "MPC Controller Deactivated.");
 }
 
@@ -78,11 +92,51 @@ void MPCController::setSpeedLimit(const double & /*speed_limit*/, const bool & /
   // 这里通常用于处理来自限速区 (speed limit zones) 的速度降低，为保持简单暂时留空
 }
 
+rcl_interfaces::msg::SetParametersResult MPCController::dynamicParametersCallback(
+  const std::vector<rclcpp::Parameter> & parameters)
+{
+  std::lock_guard<std::mutex> lock(param_mutex_);
+  rcl_interfaces::msg::SetParametersResult result;
+  result.successful = true;
+  
+  for (const auto & parameter : parameters) {
+    const std::string & name = parameter.get_name();
+    if (name == plugin_name_ + ".N") {
+      N_ = parameter.as_int();
+    } else if (name == plugin_name_ + ".dt") {
+      dt_ = parameter.as_double();
+    } else if (name == plugin_name_ + ".v_max") {
+      v_max_ = parameter.as_double();
+    } else if (name == plugin_name_ + ".v_min") {
+      v_min_ = parameter.as_double();
+    } else if (name == plugin_name_ + ".w_max") {
+      w_max_ = parameter.as_double();
+    } else if (name == plugin_name_ + ".w_min") {
+      w_min_ = parameter.as_double();
+    } else if (name == plugin_name_ + ".q_x") {
+      q_x_ = parameter.as_double();
+    } else if (name == plugin_name_ + ".q_y") {
+      q_y_ = parameter.as_double();
+    } else if (name == plugin_name_ + ".q_theta") {
+      q_theta_ = parameter.as_double();
+    } else if (name == plugin_name_ + ".r_v") {
+      r_v_ = parameter.as_double();
+    } else if (name == plugin_name_ + ".r_w") {
+      r_w_ = parameter.as_double();
+    }
+    RCLCPP_INFO(
+        logger_, "Parameter %s updated to: %s",
+        name.c_str(), parameter.value_to_string().c_str());
+  }
+  return result;
+}
+
 geometry_msgs::msg::TwistStamped MPCController::computeVelocityCommands(
   const geometry_msgs::msg::PoseStamped & pose,
   const geometry_msgs::msg::Twist & /*velocity*/,
   nav2_core::GoalChecker * /*goal_checker*/)
 {
+  std::lock_guard<std::mutex> lock(param_mutex_);
   geometry_msgs::msg::TwistStamped cmd_vel;
   cmd_vel.header.frame_id = pose.header.frame_id;
   cmd_vel.header.stamp = rclcpp::Clock().now();
@@ -91,22 +145,33 @@ geometry_msgs::msg::TwistStamped MPCController::computeVelocityCommands(
     return cmd_vel;
   }
 
+  // 将全局路径转换到与当前 pose 相同的坐标系下
+  nav_msgs::msg::Path transformed_plan;
+  if (!transformPlan(tf_, global_plan_, pose.header.frame_id, transformed_plan)) {
+    RCLCPP_ERROR(logger_, "Could not transform the global plan to the controller frame");
+    return cmd_vel;
+  }
+
+  
+  
+  // 发布转换后的局部全局路径用于 Rviz 可视化
+  transformed_plan_pub_->publish(transformed_plan);
+
   // 1. 获取机器人当前状态
   double current_x = pose.pose.position.x;
   double current_y = pose.pose.position.y;
   double current_theta = tf2::getYaw(pose.pose.orientation);
 
-  // 2. 提取局部参考轨迹 (简单最近点投影法)
-  int closest_idx = 0;
-  double min_dist = std::numeric_limits<double>::max();
-  for (size_t i = 0; i < global_plan_.poses.size(); ++i) {
-    double dx = global_plan_.poses[i].pose.position.x - current_x;
-    double dy = global_plan_.poses[i].pose.position.y - current_y;
-    double dist = dx*dx + dy*dy;
-    if (dist < min_dist) {
-      min_dist = dist;
-      closest_idx = i;
-    }
+  // 2. 截取局部规划路径 (裁剪掉最近点之前的点，并限制在代价地图范围内)
+  nav_msgs::msg::Path local_plan = extractLocalPlan(pose, transformed_plan, costmap_ros_);
+  
+  // 发布截取后的局部路径
+  transformed_local_plan_pub_->publish(local_plan);
+
+  if (local_plan.poses.empty()) {
+    RCLCPP_WARN_THROTTLE(logger_, *(node_.lock()->get_clock()), 1000, 
+                         "Local plan is empty after extraction!");
+    return cmd_vel;
   }
 
   // 采样未来 N 步的参考点 (每步跳过几个点以匹配 dt 的时间跨度)
@@ -114,11 +179,11 @@ geometry_msgs::msg::TwistStamped MPCController::computeVelocityCommands(
   std::vector<double> ref_x(N_, 0.0), ref_y(N_, 0.0), ref_theta(N_, 0.0);
   
   for (int k = 0; k < N_; ++k) {
-    int target_idx = std::min(closest_idx + (k + 1) * lookahead_skip, (int)global_plan_.poses.size() - 1);
-    ref_x[k] = global_plan_.poses[target_idx].pose.position.x;
-    ref_y[k] = global_plan_.poses[target_idx].pose.position.y;
+    int target_idx = std::min((k + 1) * lookahead_skip, (int)local_plan.poses.size() - 1);
+    ref_x[k] = local_plan.poses[target_idx].pose.position.x;
+    ref_y[k] = local_plan.poses[target_idx].pose.position.y;
     
-    double raw_theta = tf2::getYaw(global_plan_.poses[target_idx].pose.orientation);
+    double raw_theta = tf2::getYaw(local_plan.poses[target_idx].pose.orientation);
     // 展开角度差异以避免 2*PI 跳变导致的自旋
     double diff = normalize_angle(raw_theta - current_theta);
     ref_theta[k] = current_theta + diff; 
@@ -176,15 +241,15 @@ geometry_msgs::msg::TwistStamped MPCController::computeVelocityCommands(
     
     // 提取计算出的第一步最优控制指令 U[:, 0]
     casadi::Slice all;
-    std::vector<double> u_opt = std::vector<double>(sol.value(U(all, 0)));
+    std::vector<double> u_opt = static_cast<std::vector<double>>(sol.value(U(all, 0)));
     
     cmd_vel.twist.linear.x = u_opt[0];
     cmd_vel.twist.angular.z = u_opt[1];
 
     // 提取最优状态预测轨迹并发布
-    std::vector<double> x_opt = std::vector<double>(sol.value(X(0, all)));
-    std::vector<double> y_opt = std::vector<double>(sol.value(X(1, all)));
-    std::vector<double> theta_opt = std::vector<double>(sol.value(X(2, all)));
+    std::vector<double> x_opt = static_cast<std::vector<double>>(sol.value(X(0, all)));
+    std::vector<double> y_opt = static_cast<std::vector<double>>(sol.value(X(1, all)));
+    std::vector<double> theta_opt = static_cast<std::vector<double>>(sol.value(X(2, all)));
 
     nav_msgs::msg::Path predict_path;
     predict_path.header.frame_id = pose.header.frame_id;
@@ -204,6 +269,7 @@ geometry_msgs::msg::TwistStamped MPCController::computeVelocityCommands(
       p.pose.orientation.w = q.w();
       predict_path.poses.push_back(p);
     }
+    RCLCPP_INFO(logger_,"size: %zu",predict_path.poses.size());
     traj_pub_->publish(predict_path);
   } 
   catch (std::exception & e) {

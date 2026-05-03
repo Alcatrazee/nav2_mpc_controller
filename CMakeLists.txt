@@ -53,7 +53,8 @@ set(library_name ${library_name})
 # Controller library
 add_library(${library_name} SHARED
         src/mpc_controller.cpp
-        src/transform_tools.cpp)
+        src/transform_tools.cpp
+        src/ref_trajectory_generator.cpp)
 
 ament_target_dependencies(${library_name}
   ${dependencies}

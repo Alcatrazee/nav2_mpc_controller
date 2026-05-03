@@ -4,6 +4,10 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <mutex>
+#include <functional>
+#include <limits>
+#include <algorithm>
 
 #include "nav2_core/controller.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -15,6 +19,7 @@
 #include "nav2_util/node_utils.hpp"
 #include <tf2_ros/transform_listener.hpp>
 #include <tf2_ros/buffer.h>
+#include "rcl_interfaces/msg/set_parameters_result.hpp"
 
 
 namespace nav2_mpc_controller
@@ -50,8 +55,11 @@ private:
   std::string plugin_name_;
   std::shared_ptr<nav2_costmap_2d::Costmap2DROS> costmap_ros_;
   rclcpp::Logger logger_ {rclcpp::get_logger("MPCController")};
+  std::shared_ptr<tf2_ros::Buffer> tf_;
 
   rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>::SharedPtr traj_pub_;
+  rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>::SharedPtr transformed_plan_pub_;
+  rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>::SharedPtr transformed_local_plan_pub_;
   nav_msgs::msg::Path global_plan_;
 
   // MPC 参数
@@ -69,6 +77,11 @@ private:
   double r_v_;
   double r_w_;
 
+  // 动态参数调整
+  std::mutex param_mutex_;
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr dyn_params_handler_;
+  rcl_interfaces::msg::SetParametersResult dynamicParametersCallback(const std::vector<rclcpp::Parameter> & parameters);
+
   // 角度归一化辅助函数
   double normalize_angle(double angle)
   {
@@ -77,6 +90,19 @@ private:
     return angle;
   }
 };
+
+// 坐标转换辅助函数声明
+bool transformPlan(
+  const std::shared_ptr<tf2_ros::Buffer> & tf,
+  const nav_msgs::msg::Path & path,
+  const std::string & target_frame,
+  nav_msgs::msg::Path & output_path);
+
+// 局部路径截取辅助函数声明
+nav_msgs::msg::Path extractLocalPlan(
+  const geometry_msgs::msg::PoseStamped & pose,
+  const nav_msgs::msg::Path & transformed_plan,
+  const std::shared_ptr<nav2_costmap_2d::Costmap2DROS> & costmap_ros);
 
 }  // namespace nav2_mpc_controller
 
