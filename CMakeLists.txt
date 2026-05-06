@@ -20,6 +20,7 @@ find_package(tf2_geometry_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_eigen REQUIRED)
 find_package(casadi REQUIRED)
+find_package(visualization_msgs REQUIRED)
 
 nav2_package()
 set(CMAKE_CXX_STANDARD 17)
@@ -46,6 +47,7 @@ set(dependencies
   tf2_geometry_msgs
   tf2_ros
   tf2_eigen
+  visualization_msgs
 )
 
 set(library_name ${library_name})
@@ -54,7 +56,8 @@ set(library_name ${library_name})
 add_library(${library_name} SHARED
         src/mpc_controller.cpp
         src/transform_tools.cpp
-        src/ref_trajectory_generator.cpp)
+        src/ref_trajectory_generator.cpp
+        src/trajectory_profiler.cpp)
 
 ament_target_dependencies(${library_name}
   ${dependencies}

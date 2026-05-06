@@ -53,6 +53,12 @@ void MPCController::configure(
   traj_pub_ = node->create_publisher<nav_msgs::msg::Path>("predict_trajectory", 10);
   transformed_plan_pub_ = node->create_publisher<nav_msgs::msg::Path>("transformed_global_plan", 10);
   transformed_local_plan_pub_ = node->create_publisher<nav_msgs::msg::Path>("transformed_local_plan", 10);
+  local_plan_pub_ = node->create_publisher<nav_msgs::msg::Path>("local_plan", 10);
+  local_plan_marker_pub_ = node->create_publisher<visualization_msgs::msg::MarkerArray>("local_plan_markers", 10);
+
+  ProfilerConfig profiler_cfg;
+  profiler_cfg.max_velocity = v_max_;
+  trajectory_profiler_ = std::make_unique<TrajectoryProfiler>(profiler_cfg);
 
   RCLCPP_INFO(logger_, "MPC Controller Configured.");
 }
@@ -63,6 +69,8 @@ void MPCController::cleanup()
   traj_pub_.reset();
   transformed_plan_pub_.reset();
   transformed_local_plan_pub_.reset();
+  local_plan_pub_.reset();
+  local_plan_marker_pub_.reset();
   RCLCPP_INFO(logger_, "MPC Controller Cleaned Up.");
 }
 
@@ -71,6 +79,8 @@ void MPCController::activate()
   traj_pub_->on_activate();
   transformed_plan_pub_->on_activate();
   transformed_local_plan_pub_->on_activate();
+  local_plan_pub_->on_activate();
+  local_plan_marker_pub_->on_activate();
   RCLCPP_INFO(logger_, "MPC Controller Activated.");
 }
 
@@ -79,6 +89,8 @@ void MPCController::deactivate()
   traj_pub_->on_deactivate();
   transformed_plan_pub_->on_deactivate();
   transformed_local_plan_pub_->on_deactivate();
+  local_plan_pub_->on_deactivate();
+  local_plan_marker_pub_->on_deactivate();
   RCLCPP_INFO(logger_, "MPC Controller Deactivated.");
 }
 
@@ -107,6 +119,11 @@ rcl_interfaces::msg::SetParametersResult MPCController::dynamicParametersCallbac
       dt_ = parameter.as_double();
     } else if (name == plugin_name_ + ".v_max") {
       v_max_ = parameter.as_double();
+      if (trajectory_profiler_) {
+        ProfilerConfig cfg;
+        cfg.max_velocity = v_max_;
+        trajectory_profiler_ = std::make_unique<TrajectoryProfiler>(cfg);
+      }
     } else if (name == plugin_name_ + ".v_min") {
       v_min_ = parameter.as_double();
     } else if (name == plugin_name_ + ".w_max") {
@@ -131,9 +148,91 @@ rcl_interfaces::msg::SetParametersResult MPCController::dynamicParametersCallbac
   return result;
 }
 
+std::vector<TrajectoryPoint> MPCController::generateTimeParameterizedTrajectory(
+  const nav_msgs::msg::Path & local_plan, 
+  double current_speed)
+{
+  std::vector<TrajectoryPoint> ref_traj;
+  int M = local_plan.poses.size();
+  
+  if (M < 2) {
+    return ref_traj; // 路径太短，直接返回空
+  }
+
+  // 1. 计算初始输入路径的累积弧长 (s_raw)
+  std::vector<double> s_raw(M, 0.0);
+  for (int i = 1; i < M; ++i) {
+    double dx = local_plan.poses[i].pose.position.x - local_plan.poses[i-1].pose.position.x;
+    double dy = local_plan.poses[i].pose.position.y - local_plan.poses[i-1].pose.position.y;
+    s_raw[i] = s_raw[i-1] + std::hypot(dx, dy);
+  }
+  double S_total = s_raw.back();
+
+  // 2. 利用最小二乘法拟合多项式 (最高5次，动态适应点太少的情况以避免奇异)
+  int degree = std::min(5, M - 1);
+  Eigen::MatrixXd A(M, degree + 1);
+  Eigen::VectorXd B_x(M), B_y(M);
+
+  for (int i = 0; i < M; ++i) {
+    double s = s_raw[i];
+    for (int j = 0; j <= degree; ++j) {
+      A(i, j) = std::pow(s, j);
+    }
+    B_x(i) = local_plan.poses[i].pose.position.x;
+    B_y(i) = local_plan.poses[i].pose.position.y;
+  }
+
+  // SVD 分解保证最小二乘求解极度鲁棒
+  Eigen::VectorXd C_x = A.bdcSvd(Eigen::ComputeThinU | Eigen::ComputeThinV).solve(B_x);
+  Eigen::VectorXd C_y = A.bdcSvd(Eigen::ComputeThinU | Eigen::ComputeThinV).solve(B_y);
+
+  // 3. 重采样为 0.001 间隔的点
+  double ds_resample = 0.001;
+  std::vector<PathPoint> path_points;
+  int num_resampled = std::ceil(S_total / ds_resample) + 1;
+  path_points.reserve(num_resampled);
+
+  for (double s = 0; s <= S_total; s += ds_resample) {
+    double x = 0.0, y = 0.0, dx_ds = 0.0, dy_ds = 0.0, d2x_ds2 = 0.0, d2y_ds2 = 0.0;
+    for (int j = 0; j <= degree; ++j) {
+      double term = std::pow(s, j);
+      x += C_x(j) * term;
+      y += C_y(j) * term;
+      if (j >= 1) {
+        double d_term = j * std::pow(s, j - 1);
+        dx_ds += C_x(j) * d_term;
+        dy_ds += C_y(j) * d_term;
+      }
+      if (j >= 2) {
+        double d2_term = j * (j - 1) * std::pow(s, j - 2);
+        d2x_ds2 += C_x(j) * d2_term;
+        d2y_ds2 += C_y(j) * d2_term;
+      }
+    }
+
+    double theta = std::atan2(dy_ds, dx_ds);
+    double norm = dx_ds * dx_ds + dy_ds * dy_ds;
+    double kappa = (norm > 1e-6) ? (dx_ds * d2y_ds2 - dy_ds * d2x_ds2) / std::pow(norm, 1.5) : 0.0;
+
+    path_points.push_back({x, y, theta, kappa, s});
+  }
+
+  // 4. 利用 Profiler 进行速度与时间规划
+  trajectory_profiler_->generate_profile(path_points, current_speed);
+
+  // 5. 等 dt 获取 N 步采样点 (已内嵌精确插值)
+  ref_traj.resize(N_);
+  for (int k = 0; k < N_; ++k) {
+    double target_time = (k + 1) * dt_;
+    ref_traj[k] = trajectory_profiler_->get_reference_point(target_time);
+  }
+
+  return ref_traj;
+}
+
 geometry_msgs::msg::TwistStamped MPCController::computeVelocityCommands(
   const geometry_msgs::msg::PoseStamped & pose,
-  const geometry_msgs::msg::Twist & /*velocity*/,
+  const geometry_msgs::msg::Twist & velocity,
   nav2_core::GoalChecker * /*goal_checker*/)
 {
   std::lock_guard<std::mutex> lock(param_mutex_);
@@ -168,24 +267,92 @@ geometry_msgs::msg::TwistStamped MPCController::computeVelocityCommands(
   // 发布截取后的局部路径
   transformed_local_plan_pub_->publish(local_plan);
 
-  if (local_plan.poses.empty()) {
+  // 一键生成带曲率平滑的时间参数化轨迹及控制参考点
+  auto ref_points = generateTimeParameterizedTrajectory(local_plan, velocity.linear.x);
+
+  if (ref_points.empty()) {
     RCLCPP_WARN_THROTTLE(logger_, *(node_.lock()->get_clock()), 1000, 
-                         "Local plan is empty after extraction!");
+                         "Local plan is empty or failed to generate parameterized trajectory!");
     return cmd_vel;
   }
 
-  // 采样未来 N 步的参考点 (每步跳过几个点以匹配 dt 的时间跨度)
-  int lookahead_skip = 5; 
+  // 将经过N点参考点采样后的轨迹作为 Path 消息发布到 local_plan 话题
+  nav_msgs::msg::Path parameterized_local_plan;
+  parameterized_local_plan.header.frame_id = pose.header.frame_id;
+  parameterized_local_plan.header.stamp = cmd_vel.header.stamp;
+
+  for (const auto & pt : ref_points) {
+    geometry_msgs::msg::PoseStamped p;
+    p.header = parameterized_local_plan.header;
+    p.pose.position.x = pt.x;
+    p.pose.position.y = pt.y;
+    
+    tf2::Quaternion q;
+    q.setRPY(0, 0, pt.theta);
+    p.pose.orientation.x = q.x();
+    p.pose.orientation.y = q.y();
+    p.pose.orientation.z = q.z();
+    p.pose.orientation.w = q.w();
+    
+    parameterized_local_plan.poses.push_back(p);
+  }
+  local_plan_pub_->publish(parameterized_local_plan);
+
+  // 同时发布 MarkerArray，将速度大小映射为颜色
+  visualization_msgs::msg::MarkerArray marker_array;
+  
+  // 1. 添加一个 DELETEALL marker 清除 RViz 中上一帧的残留箭头
+  visualization_msgs::msg::Marker clear_marker;
+  clear_marker.action = visualization_msgs::msg::Marker::DELETEALL;
+  marker_array.markers.push_back(clear_marker);
+
+  // 2. 遍历参考点，生成彩色箭头 Marker
+  for (size_t i = 0; i < ref_points.size(); ++i) {
+    const auto & pt = ref_points[i];
+    visualization_msgs::msg::Marker marker;
+    marker.header.frame_id = pose.header.frame_id;
+    marker.header.stamp = cmd_vel.header.stamp;
+    marker.ns = "velocity_arrows";
+    marker.id = i;
+    marker.type = visualization_msgs::msg::Marker::ARROW;
+    marker.action = visualization_msgs::msg::Marker::ADD;
+
+    marker.pose.position.x = pt.x;
+    marker.pose.position.y = pt.y;
+    marker.pose.position.z = 0.0;
+    
+    tf2::Quaternion q;
+    q.setRPY(0, 0, pt.theta);
+    marker.pose.orientation.x = q.x();
+    marker.pose.orientation.y = q.y();
+    marker.pose.orientation.z = q.z();
+    marker.pose.orientation.w = q.w();
+
+    // 箭头尺寸 (x: 长度, y: 箭头宽, z: 箭头高)
+    marker.scale.x = 0.08; 
+    marker.scale.y = 0.015;
+    marker.scale.z = 0.015;
+
+    // 速度颜色映射: 计算速度比例 (绿 -> 红)
+    double ratio = std::clamp(std::abs(pt.v) / v_max_, 0.0, 1.0);
+    marker.color.r = ratio;           // 速度越接近最大值，红色通道越满
+    marker.color.g = 1.0 - ratio;     // 速度越低，绿色通道越满
+    marker.color.b = 0.0;
+    marker.color.a = 1.0;             // 不透明度
+
+    marker_array.markers.push_back(marker);
+  }
+  local_plan_marker_pub_->publish(marker_array);
+
+  // 从时间参数化轨迹中按时间采样未来 N 步的参考点
   std::vector<double> ref_x(N_, 0.0), ref_y(N_, 0.0), ref_theta(N_, 0.0);
   
   for (int k = 0; k < N_; ++k) {
-    int target_idx = std::min((k + 1) * lookahead_skip, (int)local_plan.poses.size() - 1);
-    ref_x[k] = local_plan.poses[target_idx].pose.position.x;
-    ref_y[k] = local_plan.poses[target_idx].pose.position.y;
+    ref_x[k] = ref_points[k].x;
+    ref_y[k] = ref_points[k].y;
     
-    double raw_theta = tf2::getYaw(local_plan.poses[target_idx].pose.orientation);
     // 展开角度差异以避免 2*PI 跳变导致的自旋
-    double diff = normalize_angle(raw_theta - current_theta);
+    double diff = normalize_angle(ref_points[k].theta - current_theta);
     ref_theta[k] = current_theta + diff; 
   }
 

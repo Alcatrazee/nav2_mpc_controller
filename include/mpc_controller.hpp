@@ -15,11 +15,14 @@
 #include "geometry_msgs/msg/twist_stamped.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "nav_msgs/msg/path.hpp"
+#include "visualization_msgs/msg/marker_array.hpp"
 #include "casadi/casadi.hpp"
 #include "nav2_util/node_utils.hpp"
 #include <tf2_ros/transform_listener.hpp>
 #include <tf2_ros/buffer.h>
 #include "rcl_interfaces/msg/set_parameters_result.hpp"
+#include "trajectory_profiler.hpp"
+#include <Eigen/Dense>
 
 
 namespace nav2_mpc_controller
@@ -60,6 +63,8 @@ private:
   rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>::SharedPtr traj_pub_;
   rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>::SharedPtr transformed_plan_pub_;
   rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>::SharedPtr transformed_local_plan_pub_;
+  rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>::SharedPtr local_plan_pub_;
+  rclcpp_lifecycle::LifecyclePublisher<visualization_msgs::msg::MarkerArray>::SharedPtr local_plan_marker_pub_;
   nav_msgs::msg::Path global_plan_;
 
   // MPC 参数
@@ -81,6 +86,14 @@ private:
   std::mutex param_mutex_;
   rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr dyn_params_handler_;
   rcl_interfaces::msg::SetParametersResult dynamicParametersCallback(const std::vector<rclcpp::Parameter> & parameters);
+
+  std::unique_ptr<TrajectoryProfiler> trajectory_profiler_;
+
+  // 新增的时间参数化核心函数
+  std::vector<TrajectoryPoint> generateTimeParameterizedTrajectory(
+    const nav_msgs::msg::Path & local_plan, 
+    double current_speed);
+
 
   // 角度归一化辅助函数
   double normalize_angle(double angle)
