@@ -23,6 +23,7 @@
 #include "rcl_interfaces/msg/set_parameters_result.hpp"
 #include "trajectory_profiler.hpp"
 #include <Eigen/Dense>
+#include "nav2_costmap_2d/footprint_collision_checker.hpp"
 
 
 namespace nav2_mpc_controller
@@ -65,6 +66,7 @@ private:
   rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>::SharedPtr transformed_local_plan_pub_;
   rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>::SharedPtr local_plan_pub_;
   rclcpp_lifecycle::LifecyclePublisher<visualization_msgs::msg::MarkerArray>::SharedPtr local_plan_marker_pub_;
+  rclcpp_lifecycle::LifecyclePublisher<visualization_msgs::msg::MarkerArray>::SharedPtr lattice_candidates_pub_;
   nav_msgs::msg::Path global_plan_;
 
   // MPC 参数
@@ -81,6 +83,15 @@ private:
   double q_theta_;
   double r_v_;
   double r_w_;
+  
+  // Lattice Planner 参数
+  double lattice_lookahead_dist_;
+  double lattice_lat_range_;
+  double lattice_lat_step_;
+  std::vector<double> lattice_lon_ratios_;
+  double weight_obs_;
+  double weight_lat_;
+  double weight_smooth_;
 
   // 动态参数调整
   std::mutex param_mutex_;
@@ -93,6 +104,18 @@ private:
   std::vector<TrajectoryPoint> generateTimeParameterizedTrajectory(
     const nav_msgs::msg::Path & local_plan, 
     double current_speed);
+
+  // 新增的最简 Lattice Planner，用于生成候选曲线并结合障碍物评价选出最优轨迹
+  nav_msgs::msg::Path generateLatticePlan(
+    const geometry_msgs::msg::PoseStamped & pose,
+    const nav_msgs::msg::Path & base_plan,
+    nav2_costmap_2d::FootprintCollisionChecker<nav2_costmap_2d::Costmap2D *> & checker,
+    bool is_plan_contain_goal);
+
+  // 将速度参数化后的局部路径及MarkerArray发布到可视化话题的辅助函数
+  void publishParameterizedTrajectory(
+    const std::vector<TrajectoryPoint> & ref_points,
+    const std_msgs::msg::Header & header);
 
 
   // 角度归一化辅助函数
