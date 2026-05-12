@@ -35,7 +35,6 @@ void MPCController::configure(
   declare_parameter_if_not_declared(node, plugin_name_ + ".q_x", rclcpp::ParameterValue(1.0));
   declare_parameter_if_not_declared(node, plugin_name_ + ".q_y", rclcpp::ParameterValue(1.0));
   declare_parameter_if_not_declared(node, plugin_name_ + ".q_theta", rclcpp::ParameterValue(0.1));
-  declare_parameter_if_not_declared(node, plugin_name_ + ".r_v", rclcpp::ParameterValue(0.1));
   declare_parameter_if_not_declared(node, plugin_name_ + ".r_v", rclcpp::ParameterValue(1.0));
   declare_parameter_if_not_declared(node, plugin_name_ + ".r_w", rclcpp::ParameterValue(0.1));
   declare_parameter_if_not_declared(node, plugin_name_ + ".r_a", rclcpp::ParameterValue(0.1));
@@ -53,6 +52,7 @@ void MPCController::configure(
   declare_parameter_if_not_declared(node, plugin_name_ + ".weight_obs", rclcpp::ParameterValue(2.0));
   declare_parameter_if_not_declared(node, plugin_name_ + ".weight_lat", rclcpp::ParameterValue(1.0));
   declare_parameter_if_not_declared(node, plugin_name_ + ".weight_smooth", rclcpp::ParameterValue(0.5));
+  declare_parameter_if_not_declared(node, plugin_name_ + ".weight_lat_change", rclcpp::ParameterValue(1.5));
 
   node->get_parameter(plugin_name_ + ".N", N_);
   node->get_parameter(plugin_name_ + ".dt", dt_);
@@ -85,6 +85,7 @@ void MPCController::configure(
   node->get_parameter(plugin_name_ + ".weight_obs", weight_obs_);
   node->get_parameter(plugin_name_ + ".weight_lat", weight_lat_);
   node->get_parameter(plugin_name_ + ".weight_smooth", weight_smooth_);
+  node->get_parameter(plugin_name_ + ".weight_lat_change", weight_lat_change_);
 
   // 注册动态参数回调
   dyn_params_handler_ = node->add_on_set_parameters_callback(
@@ -147,6 +148,7 @@ void MPCController::setPlan(const nav_msgs::msg::Path & path)
 {
   global_plan_ = path;
   prev_local_plan_.poses.clear(); // 收到新的全局路径时清除旧缓存
+  prev_best_lat_ = 0.0;           // 重置横向偏移缓存，重新起步时不带历史惯性
 }
 
 void MPCController::setSpeedLimit(const double & /*speed_limit*/, const bool & /*percentage*/)
@@ -243,6 +245,8 @@ rcl_interfaces::msg::SetParametersResult MPCController::dynamicParametersCallbac
       weight_lat_ = parameter.as_double();
     } else if (name == plugin_name_ + ".weight_smooth") {
       weight_smooth_ = parameter.as_double();
+    } else if (name == plugin_name_ + ".weight_lat_change") {
+      weight_lat_change_ = parameter.as_double();
     }
     RCLCPP_INFO(
         logger_, "Parameter %s updated to: %s",
@@ -312,8 +316,6 @@ void MPCController::initializeMPC()
     cost += r_w_ * pow(U_(1, k) - Ref_w_param_(k), 2);
     cost += r_a_ * pow(U_(0, k), 2);
     
-    // 软约束：转弯半径越小，惩罚越大
-    cost += weight_turn_radius_ * (pow(U_(1, k), 2) / (pow(X_(3, k+1), 2) + 0.01));
     // 软约束优化：惩罚侧向向心加速度 (v * w)
     // 彻底修复原先 w^2/v^2 导致分母为 v 从而恶意奖励小车超速冲线的问题。
     // 现在，当遇到弯道或需要调整航向 (w较大) 时，小车会为了降低代价而天然主动减速！

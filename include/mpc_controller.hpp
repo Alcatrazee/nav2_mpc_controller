@@ -105,6 +105,8 @@ private:
   double weight_obs_;
   double weight_lat_;
   double weight_smooth_;
+  double weight_lat_change_;  // 横向跳变惩罚权重 (保证时序一致性)
+  double prev_best_lat_{0.0}; // 记录上一帧的最优横向偏移量
 
   // 动态参数调整
   std::mutex param_mutex_;

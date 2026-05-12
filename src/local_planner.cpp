@@ -351,10 +351,14 @@ nav_msgs::msg::Path MPCController::generateLatticePlan(
         double norm_smooth = cand.smooth_cost / max_smooth_cost;
         double norm_lat = std::abs(cand.lat) / max_lat_cost;
         double norm_lon = cand.lon_dist / max_lon_dist;
+        
+        // 计算与上一帧横向偏移量的差距，做归一化处理
+        double norm_lat_change = std::abs(cand.lat - prev_best_lat_) / (lattice_lat_range_ + 1e-5);
 
         cand.score = weight_obs_ * norm_obs +
                      weight_smooth_ * norm_smooth +
-                     weight_lat_ * norm_lat -
+                     weight_lat_ * norm_lat +
+                     weight_lat_change_ * norm_lat_change -
                      1.0 * norm_lon;
         
         if (cand.score < best_score) {
@@ -406,6 +410,10 @@ nav_msgs::msg::Path MPCController::generateLatticePlan(
     //               candidates[best_idx].lat, candidates[best_idx].score);
   } else {
       RCLCPP_WARN(logger_, "All Lattice Candidates in collision!");
+  }
+
+  if (best_idx != -1) {
+      prev_best_lat_ = candidates[best_idx].lat; // 更新历史最佳偏移量
   }
 
   return best_plan;
