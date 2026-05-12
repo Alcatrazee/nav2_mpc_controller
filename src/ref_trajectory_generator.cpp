@@ -61,66 +61,108 @@ namespace nav2_mpc_controller
         return ref_traj; // 路径太短，直接返回空
     }
 
-    // 1. 计算初始输入路径的累积弧长 (s_raw)
-    std::vector<double> s_raw(M, 0.0);
-    for (int i = 1; i < M; ++i) {
-        double dx = local_plan.poses[i].pose.position.x - local_plan.poses[i-1].pose.position.x;
-        double dy = local_plan.poses[i].pose.position.y - local_plan.poses[i-1].pose.position.y;
-        s_raw[i] = s_raw[i-1] + std::hypot(dx, dy);
-    }
-    double S_total = s_raw.back();
-
-    // 2. 利用最小二乘法拟合多项式 (最高5次，动态适应点太少的情况以避免奇异)
-    int degree = std::min(5, M - 1);
-    Eigen::MatrixXd A(M, degree + 1);
-    Eigen::VectorXd B_x(M), B_y(M);
-
+    // 1. 提取原始路径点
+    std::vector<PathPoint> path_points(M);
     for (int i = 0; i < M; ++i) {
-        double s = s_raw[i];
-        for (int j = 0; j <= degree; ++j) {
-        A(i, j) = std::pow(s, j);
-        }
-        B_x(i) = local_plan.poses[i].pose.position.x;
-        B_y(i) = local_plan.poses[i].pose.position.y;
+        path_points[i].x = local_plan.poses[i].pose.position.x;
+        path_points[i].y = local_plan.poses[i].pose.position.y;
+        path_points[i].theta = tf2::getYaw(local_plan.poses[i].pose.orientation);
     }
 
-    // SVD 分解保证最小二乘求解极度鲁棒
-    Eigen::VectorXd C_x = A.bdcSvd(Eigen::ComputeThinU | Eigen::ComputeThinV).solve(B_x);
-    Eigen::VectorXd C_y = A.bdcSvd(Eigen::ComputeThinU | Eigen::ComputeThinV).solve(B_y);
+    // 1.5 针对原始 A* 等非平滑路径进行带数据保形约束的平滑 (Data-Constrained Smoothing)
+    if (!use_local_plan_) {
+        // 备份原始路径点，用于提供保形引力
+        std::vector<PathPoint> original_points = path_points;
+        
+        int smooth_iterations = 30; // 增加迭代次数以彻底消除曲率毛刺
+        double alpha = 0.3;         // 平滑权重 (拉向相邻点中点)
+        double beta = 0.2;          // 保形权重 (拉回原始路径的力度，防止切内弯)
+        
+        for (int iter = 0; iter < smooth_iterations; ++iter) {
+            for (int i = 1; i < M - 1; ++i) {
+                double smooth_dx = path_points[i-1].x + path_points[i+1].x - 2.0 * path_points[i].x;
+                double smooth_dy = path_points[i-1].y + path_points[i+1].y - 2.0 * path_points[i].y;
+                
+                double data_dx = original_points[i].x - path_points[i].x;
+                double data_dy = original_points[i].y - path_points[i].y;
 
-    // 3. 重采样为 0.001 间隔的点
-    double ds_resample = 0.001;
-    std::vector<PathPoint> path_points;
-    int num_resampled = std::ceil(S_total / ds_resample) + 1;
-    path_points.reserve(num_resampled);
-
-    for (double s = 0; s <= S_total; s += ds_resample) {
-        double x = 0.0, y = 0.0, dx_ds = 0.0, dy_ds = 0.0, d2x_ds2 = 0.0, d2y_ds2 = 0.0;
-        for (int j = 0; j <= degree; ++j) {
-        double term = std::pow(s, j);
-        x += C_x(j) * term;
-        y += C_y(j) * term;
-        if (j >= 1) {
-            double d_term = j * std::pow(s, j - 1);
-            dx_ds += C_x(j) * d_term;
-            dy_ds += C_y(j) * d_term;
+                path_points[i].x += alpha * smooth_dx + beta * data_dx;
+                path_points[i].y += alpha * smooth_dy + beta * data_dy;
+            }
         }
-        if (j >= 2) {
-            double d2_term = j * (j - 1) * std::pow(s, j - 2);
-            d2x_ds2 += C_x(j) * d2_term;
-            d2y_ds2 += C_y(j) * d2_term;
+        
+        // 使用中心差分重新计算平滑后的朝向 (theta)，保留 path_points[0].theta 为当前机器人的真实朝向
+        for (int i = 1; i < M - 1; ++i) {
+            double dx = path_points[i+1].x - path_points[i-1].x;
+            double dy = path_points[i+1].y - path_points[i-1].y;
+            if (std::hypot(dx, dy) > 1e-4) {
+                path_points[i].theta = std::atan2(dy, dx);
+            }
         }
+        double dx_end = path_points[M-1].x - path_points[M-2].x;
+        double dy_end = path_points[M-1].y - path_points[M-2].y;
+        if (std::hypot(dx_end, dy_end) > 1e-4) {
+            path_points[M-1].theta = std::atan2(dy_end, dx_end);
         }
+    }
 
-        double theta = std::atan2(dy_ds, dx_ds);
-        double norm = dx_ds * dx_ds + dy_ds * dy_ds;
-        double kappa = (norm > 1e-6) ? (dx_ds * d2y_ds2 - dy_ds * d2x_ds2) / std::pow(norm, 1.5) : 0.0;
+    // 1.6 重新计算累积弧长 (s)
+    path_points[0].s = 0.0;
+    for (int i = 1; i < M; ++i) {
+        double dx = path_points[i].x - path_points[i-1].x;
+        double dy = path_points[i].y - path_points[i-1].y;
+        path_points[i].s = path_points[i-1].s + std::hypot(dx, dy);
+    }
 
-        path_points.push_back({x, y, theta, kappa, s});
+    // 2. 利用运动学朝向精确计算离散曲率 (kappa = d_theta / ds)
+    // 彻底摒弃高阶多项式带来的龙格震荡灾难
+    for (int i = 0; i < M; ++i) {
+        if (i == 0 || i == M - 1) {
+            path_points[i].kappa = 0.0;
+        } else {
+            double th1 = path_points[i-1].theta;
+            double th2 = path_points[i+1].theta;
+            double dth = th2 - th1;
+            while (dth > M_PI) dth -= 2.0 * M_PI;
+            while (dth < -M_PI) dth += 2.0 * M_PI;
+            
+            double ds = path_points[i+1].s - path_points[i-1].s;
+            path_points[i].kappa = (ds > 1e-4) ? (dth / ds) : 0.0;
+        }
+    }
+
+    // 3. 几何稠密化重采样 (最高 0.02m 分辨率)，为 Profiler 提供安全且无震荡的路径积分空间
+    double max_ds = 0.02; 
+    std::vector<PathPoint> dense_points;
+    dense_points.push_back(path_points[0]);
+    
+    for (int i = 1; i < M; ++i) {
+        double ds = path_points[i].s - path_points[i-1].s;
+        if (ds > max_ds) {
+            int num_inserts = std::floor(ds / max_ds);
+            for (int j = 1; j <= num_inserts; ++j) {
+                double ratio = static_cast<double>(j) / (num_inserts + 1.0);
+                PathPoint pt;
+                pt.x = path_points[i-1].x + ratio * (path_points[i].x - path_points[i-1].x);
+                pt.y = path_points[i-1].y + ratio * (path_points[i].y - path_points[i-1].y);
+                
+                double th1 = path_points[i-1].theta;
+                double th2 = path_points[i].theta;
+                double dth = th2 - th1;
+                while (dth > M_PI) dth -= 2.0 * M_PI;
+                while (dth < -M_PI) dth += 2.0 * M_PI;
+                pt.theta = th1 + ratio * dth;
+                
+                pt.kappa = path_points[i-1].kappa + ratio * (path_points[i].kappa - path_points[i-1].kappa);
+                pt.s = path_points[i-1].s + ratio * ds;
+                dense_points.push_back(pt);
+            }
+        }
+        dense_points.push_back(path_points[i]);
     }
 
     // 4. 利用 Profiler 进行速度与时间规划
-    trajectory_profiler_->generate_profile(path_points, current_speed);
+    trajectory_profiler_->generate_profile(dense_points, current_speed);
 
     // 5. 等 dt 获取 N 步采样点 (已内嵌精确插值)
     ref_traj.resize(N_);

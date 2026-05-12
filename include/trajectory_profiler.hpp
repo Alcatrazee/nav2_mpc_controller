@@ -29,8 +29,8 @@ struct TrajectoryPoint {
  */
 struct ProfilerConfig {
   double max_velocity = 1.5;     // Absolute max forward speed [m/s]
-  double max_lon_accel = 1.0;    // Max forward acceleration [m/s^2]
-  double max_lon_decel = 1.0;    // Max braking deceleration [m/s^2] (Absolute positive value)
+  double max_a = 1.0;            // Max forward acceleration [m/s^2]
+  double min_a = -1.0;           // Min forward acceleration (deceleration) [m/s^2]
   double max_lat_accel = 1.5;    // Max lateral acceleration [m/s^2]
 };
 

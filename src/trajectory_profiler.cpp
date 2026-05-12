@@ -41,7 +41,7 @@ void TrajectoryProfiler::generate_profile(const std::vector<PathPoint> & path, d
     double ds = path[i].s - path[i - 1].s;
     if (ds < 0.0) ds = 0.0;
 
-    double v_fwd_next = std::sqrt(std::pow(v_fwd[i - 1], 2) + 2.0 * config_.max_lon_accel * ds);
+    double v_fwd_next = std::sqrt(std::pow(v_fwd[i - 1], 2) + 2.0 * config_.max_a * ds);
     v_fwd[i] = std::min(v_max[i], v_fwd_next);
   }
 
@@ -51,7 +51,7 @@ void TrajectoryProfiler::generate_profile(const std::vector<PathPoint> & path, d
     double ds = path[i + 1].s - path[i].s;
     if (ds < 0.0) ds = 0.0;
 
-    double v_back = std::sqrt(std::pow(v_final[i + 1], 2) + 2.0 * std::abs(config_.max_lon_decel) * ds);
+    double v_back = std::sqrt(std::pow(v_final[i + 1], 2) + 2.0 * std::abs(config_.min_a) * ds);
     v_final[i] = std::min(v_fwd[i], v_back);
   }
 

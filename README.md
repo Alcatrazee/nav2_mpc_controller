@@ -43,33 +43,51 @@ controller_server:
     FollowPath:
       plugin: "nav2_mpc_controller::MPCController"
       
-      # --- MPC 预测与边界参数 ---
-      N: 15            # MPC预测时域步数 (默认: 15)
-      dt: 0.1          # MPC预测离散步长，单位：s (默认: 0.1)
-      v_max: 0.5       # 机器人最大前向线速度，单位：m/s (也是Profiler的参考上限)
-      v_min: 0.0       # 机器人最小线速度 (默认限制不倒车)
-      w_max: 1.0       # 机器人最大角速度，单位：rad/s
-      w_min: -1.0      # 机器人最小角速度，单位：rad/s
+      # --- MPC 预测与运动学边界参数 ---
+      N: 32            # MPC预测时域步数 (默认: 15)
+      dt: 0.05          # MPC预测离散步长，单位：s (默认: 0.1)
+      v_max: 0.5       # 机器人最大前向线速度，单位：m/s
+      v_min: -0.3       # 机器人最小线速度 (默认限制不倒车)
+      w_max: 1.5       # 机器人最大角速度，单位：rad/s
+      w_min: -1.50      # 机器人最小角速度，单位：rad/s
+      a_max: 0.5       # 机器人最大线加速度，单位：m/s^2 (底层物理极限)
+      a_min: -0.5      # 机器人最小线加速度(最大减速度)，单位：m/s^2 (底层物理极限)
+      
+      # --- 轨迹速度规划器 (Trajectory Profiler) 专属参数 ---
+      max_lat_accel: 0.5   # 机器人允许的最大侧向(向心)加速度，用于过弯限速，单位：m/s^2
+      accel_ratio: 0.8     # 速度规划器使用的加速能力比例 (0.0~1.0)，预留余量给MPC纠偏
+      decel_ratio: 0.3     # 速度规划器使用的减速能力比例 (0.0~1.0)，调小可实现提早平滑刹车
       
       # --- 代价函数权重参数 ---
       q_x: 1.0         # X坐标追踪误差惩罚权重
       q_y: 1.0         # Y坐标追踪误差惩罚权重
       q_theta: 0.1     # 航向角(Yaw)追踪误差惩罚权重
-      r_v: 0.1         # 线速度控制量大小惩罚权重（防止加减速过猛）
-      r_w: 0.1         # 角速度控制量大小惩罚权重（防止自旋过猛）
+      r_v: 1.0         # 线速度追踪误差权重 (越高越倾向于保持目标速度/最高速)
+      r_w: 0.1         # 角速度追踪误差权重 (决定过弯和贴合路径的精准度)
+      r_a: 0.1         # 加速度输入变化惩罚权重 (控制加减速的平滑度)
+      weight_turn_radius: 0.01 # 侧向向心加速度惩罚 (软约束: 促使弯道主动减速，防止冲出)
+      min_turning_radius: 0.0 # 最小转弯半径硬约束 (设为0表示允许原地旋转)
+      cmd_vel_filter_alpha: 0.5 # 输出指令一阶低通滤波系数 (0.0~1.0，1.0为不滤波，越小越平滑)
       
-      # --- Lattice Planner 横向避障采样参数 ---
-      lattice_lookahead_dist: 1.5  # 前瞻目标点距离，单位：m (默认: 1.5)
-      lattice_lat_range: 0.8       # 横向采样范围，单位：m (默认: +/- 0.8)
-      lattice_lat_step: 0.2        # 横向采样步长，单位：m (默认: 0.2)
-      lattice_lon_ratios: [0.6, 0.8, 1.0] # 多个前向采样点的距离比例 (默认: [0.6, 0.8, 1.0])
-      weight_obs: 2.0              # 障碍物代价值权重 (默认: 2.0)
-      weight_lat: 1.0              # 轨迹横向偏离全局路径代价权重 (默认: 1.0)
-      weight_smooth: 0.5           # 轨迹曲率平滑舒适性代价权重 (默认: 0.5)
+      # --- Lattice Planner 与 纯跟踪参数 ---
+      use_local_plan: true         # 是否开启 Lattice Planner (设为 false 则为纯跟踪+平滑)
+      # Lattice 前瞻距离由公式计算: dist = base + speed * time
+      lattice_base_lookahead_dist: 0.75  # 基础前瞻距离，单位：m
+      lattice_max_lookahead_dist: 2.0   # 最大前瞻距离，单位：m
+      lattice_lookahead_time: 2.0       # 前瞻时间增益，单位：s
+      lattice_lat_range: 0.2            # 横向采样范围，单位：m (默认: +/- 0.8)
+      lattice_lat_step: 0.1             # 横向采样步长，单位：m (默认: 0.2)
+      lattice_lon_ratios: [0.6,  1.0] # 多分层B样条前向采样距离比例
+      weight_obs: 8.0                   # Lattice 障碍物代价值权重
+      weight_lat: 1.0                   # Lattice 轨迹横向偏离中心路径代价权重
+      weight_smooth: 0.5                # Lattice 轨迹曲率平滑舒适性代价权重
 ```
 
-## 已实现功能
+## 已实现功能  
+
 1. 跟踪任意的路径（但无障碍物识别和停障或绕障功能）
 2. 发布可视化的路径信息（即根据速度变化的箭头）
+
 ## 待实现功能
-1. 局部绕障
+
+1. 局部绕障  

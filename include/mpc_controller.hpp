@@ -76,6 +76,11 @@ private:
   double v_min_;         // 最小线速度
   double w_max_;         // 最大角速度
   double w_min_;         // 最小角速度
+  double a_max_;         // 最大线加速度
+  double a_min_;         // 最小线加速度
+  double max_lat_accel_; // 最大侧向加速度
+  double accel_ratio_;   // 规划器加速比例 (0.0 ~ 1.0)
+  double decel_ratio_;   // 规划器减速比例 (0.0 ~ 1.0)
   
   // 权重参数
   double q_x_;
@@ -83,9 +88,17 @@ private:
   double q_theta_;
   double r_v_;
   double r_w_;
+  double r_a_;
+  double weight_turn_radius_;
+  double min_turning_radius_;
+  double cmd_vel_filter_alpha_; // 输出指令的一阶低通滤波系数
   
   // Lattice Planner 参数
-  double lattice_lookahead_dist_;
+  bool use_local_plan_;
+  double lattice_base_lookahead_dist_;
+  double lattice_max_lookahead_dist_;
+  double lattice_lookahead_time_;
+  double lattice_lookahead_dist_; // 动态计算的当前前瞻距离
   double lattice_lat_range_;
   double lattice_lat_step_;
   std::vector<double> lattice_lon_ratios_;
@@ -117,7 +130,34 @@ private:
     const std::vector<TrajectoryPoint> & ref_points,
     const std_msgs::msg::Header & header);
 
+  // CasADi MPC 优化器属性及参数
+  casadi::Opti opti_;
+  casadi::MX X_;
+  casadi::MX U_;
+  casadi::MX X0_param_;
+  casadi::MX Ref_x_param_;
+  casadi::MX Ref_y_param_;
+  casadi::MX Ref_theta_param_;
+  casadi::MX Ref_v_param_;
+  casadi::MX Ref_w_param_;
+  bool mpc_problem_initialized_{false};
+  bool is_cold_start_{true};
+  
+  nav_msgs::msg::Path prev_local_plan_; // 保存上一帧的局部路径
 
+  // 用于 Warm Start 存储上一帧的结果
+  std::vector<double> prev_x_sol_;
+  std::vector<double> prev_y_sol_;
+  std::vector<double> prev_theta_sol_;
+  std::vector<double> prev_v_sol_;
+  std::vector<double> prev_w_sol_;
+  std::vector<double> prev_a_sol_;
+
+  // 用于低通滤波缓存的上一帧速度指令
+  double last_cmd_v_{0.0};
+  double last_cmd_w_{0.0};
+
+  void initializeMPC();
   // 角度归一化辅助函数
   double normalize_angle(double angle)
   {

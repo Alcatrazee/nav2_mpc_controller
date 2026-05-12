@@ -49,7 +49,7 @@ nav_msgs::msg::Path MPCController::generateLatticePlan(
   }
   double total_base_s = base_s.back();
 
-  if (total_base_s < 0.01) {
+  if (total_base_s < 0.001) {
       return best_plan;
   }
 
@@ -107,130 +107,222 @@ nav_msgs::msg::Path MPCController::generateLatticePlan(
   delta_theta = std::clamp(delta_theta, -M_PI/3.0, M_PI/3.0);
   double d_prime0 = std::tan(delta_theta);
 
-  double previous_target_s = -1.0;
+  // 3. 分层多前瞻距离采样与多项式拟合 (Hierarchical Lattice)
+  std::vector<double> valid_s;
+  std::vector<std::vector<double>> valid_lat_samples;
 
-  // 3. 多前瞻距离采样与横向偏移计算
-  for (double lon_ratio : lattice_lon_ratios_) {
-      double target_s = lattice_lookahead_dist_ * lon_ratio;
-      if (target_s > total_base_s) {
-          target_s = total_base_s;
-      }
-      if (target_s < 0.1) {
+  for (double ratio : lattice_lon_ratios_) {
+      RCLCPP_INFO(logger_,"ratio: %.2f",ratio);
+      double s_i = lattice_lookahead_dist_ * ratio;
+      if (s_i > total_base_s) s_i = total_base_s;
+      if (s_i < 0.01) continue;
+      
+      // 防止局部路径过短导致重复距离 (避免矩阵奇异)
+      if (!valid_s.empty() && std::abs(s_i - valid_s.back()) < 1e-3) {
           continue;
       }
-
-      // 防止局部路径过短导致重复计算
-      if (std::abs(target_s - previous_target_s) < 1e-3) {
-          continue;
-      }
-      previous_target_s = target_s;
-
-      bool is_end_of_plan = (target_s >= total_base_s - 1e-3);
-
-      double lat_start = -lattice_lat_range_;
-      double lat_end = lattice_lat_range_;
-      double lat_step = lattice_lat_step_;
-
+      valid_s.push_back(s_i);
+      
+      bool is_end = (s_i >= total_base_s - 1e-3);
+      std::vector<double> samples;
       // 抵达终点附近时收敛横向误差，保证准确到达
-      if (is_plan_contain_goal && is_end_of_plan) {
-          lat_start = 0.0;
-          lat_end = 0.0;
+      if (is_plan_contain_goal && is_end) {
+          samples.push_back(0.0);
+      } else {
+          for (double lat = -lattice_lat_range_; lat <= lattice_lat_range_ + 1e-5; lat += lattice_lat_step_) {
+              samples.push_back(lat);
+          }
+      }
+      valid_lat_samples.push_back(samples);
+  }
+
+  if (valid_s.empty()) {
+      return best_plan;
+  }
+
+  double S_max = valid_s.back();
+  int K = valid_s.size();
+
+  // 归一化后的初始导数
+  double v0 = d_prime0 * S_max;
+
+  // --- 三次 B 样条配置开始 ---
+  int p = 3; // 样条阶数 (Cubic B-Spline)
+  int n_cp = K + 4; // 控制点数量: Start(1) + Vel(1) + Internal(K-1) + End(3)
+  std::vector<double> U(n_cp + p + 1, 0.0); // 节点向量
+
+  // 计算各层距离的归一化比例
+  std::vector<double> layer_ratios;
+  layer_ratios.push_back(0.0);
+  for (int i = 0; i < K; ++i) {
+      layer_ratios.push_back(valid_s[i] / S_max);
+  }
+  
+  // 内部节点设为相邻比例层的中点，使得各层控制点的影响峰值完美贴合动态设定的纵向比例
+  for (int i = 0; i <= p; ++i) U[i] = 0.0;
+  for (int i = 1; i <= K; ++i) {
+      U[p + i] = (layer_ratios[i - 1] + layer_ratios[i]) / 2.0;
+  }
+  
+  for (int i = n_cp; i < n_cp + p + 1; ++i) U[i] = 1.0;
+
+  // B 样条基函数闭包
+  std::function<double(int, int, double)> bspline_basis = [&](int i, int p_deg, double u) -> double {
+      if (p_deg == 0) {
+          if (U[i] < U[i+1]) {
+              if (u >= U[i] && u < U[i+1]) return 1.0;
+              // 处理 u=1 落在最后一个有效节点区间的情况
+              if (std::abs(u - 1.0) < 1e-6 && std::abs(U[i+1] - 1.0) < 1e-6) return 1.0;
+          }
+          return 0.0;
+      }
+      double left = 0.0, right = 0.0;
+      if (U[i+p_deg] - U[i] > 1e-6) {
+          left = (u - U[i]) / (U[i+p_deg] - U[i]) * bspline_basis(i, p_deg-1, u);
+      }
+      if (U[i+p_deg+1] - U[i+1] > 1e-6) {
+          right = (U[i+p_deg+1] - u) / (U[i+p_deg+1] - U[i+1]) * bspline_basis(i+1, p_deg-1, u);
+      }
+      return left + right;
+  };
+
+  // B 样条基函数导数闭包
+  std::function<double(int, int, double)> bspline_deriv = [&](int i, int p_deg, double u) -> double {
+      double left = 0.0, right = 0.0;
+      if (U[i+p_deg] - U[i] > 1e-6) {
+          left = p_deg / (U[i+p_deg] - U[i]) * bspline_basis(i, p_deg-1, u);
+      }
+      if (U[i+p_deg+1] - U[i+1] > 1e-6) {
+          right = p_deg / (U[i+p_deg+1] - U[i+1]) * bspline_basis(i+1, p_deg-1, u);
+      }
+      return left - right;
+  };
+
+  int num_samples = std::max(20, 10 * K); 
+  std::vector<std::vector<double>> B(num_samples + 1, std::vector<double>(n_cp, 0.0));
+  std::vector<std::vector<double>> B_prime(num_samples + 1, std::vector<double>(n_cp, 0.0));
+
+  // 预计算所有采样点的基函数值，极大加速组合遍历
+  for (int i = 0; i <= num_samples; ++i) {
+      double u = static_cast<double>(i) / num_samples;
+      for (int j = 0; j < n_cp; ++j) {
+          B[i][j] = bspline_basis(j, p, u);
+          B_prime[i][j] = bspline_deriv(j, p, u);
+      }
+  }
+  // --- B 样条配置结束 ---
+
+  // 递归生成所有分层的横向偏移组合
+  std::vector<std::vector<double>> all_combinations;
+  std::function<void(int, std::vector<double>&)> generate_combos = [&](int layer_idx, std::vector<double>& current_combo) {
+      if (layer_idx == K) {
+          all_combinations.push_back(current_combo);
+          return;
+      }
+      for (double lat : valid_lat_samples[layer_idx]) {
+          // 启发式剪枝：丢弃相邻层横向跳变过大的锯齿形轨迹，防止组合爆炸
+          if (!current_combo.empty()) {
+              if (std::abs(lat - current_combo.back()) > lattice_lat_range_ * 1.5) {
+                  continue;
+              }
+          }
+          current_combo.push_back(lat);
+          generate_combos(layer_idx + 1, current_combo);
+          current_combo.pop_back();
+      }
+  };
+  std::vector<double> initial_combo;
+  generate_combos(0, initial_combo);
+
+  for (const auto& lat_combo : all_combinations) {
+      // 构建 B 样条控制点
+      std::vector<double> CP(n_cp, 0.0);
+      CP[0] = d0;
+      CP[1] = d0 + v0 * U[p + 1] / 3.0; // 满足起始导数
+      
+      for (int i = 0; i < K - 1; ++i) {
+          CP[i + 2] = lat_combo[i];
       }
       
-      for (double lat = lat_start; lat <= lat_end + 1e-5; lat += lat_step) {
+      double lat_end = lat_combo.back();
+      CP[n_cp - 3] = lat_end; // 终点位置
+      CP[n_cp - 2] = lat_end; // 终点一阶导数为 0
+      CP[n_cp - 1] = lat_end; // 终点二阶导数为 0
+
+      nav_msgs::msg::Path candidate_path;
+      candidate_path.header = base_plan.header;
+      
+      bool collision = false;
+      double obs_cost_sum = 0.0;
+      double smooth_cost_sum = 0.0;
+
+      for (int i = 0; i <= num_samples; ++i) {
+          double u = static_cast<double>(i) / num_samples;
+          double s_i = u * S_max;
           
-          // 在归一化参数 u 上的五次多项式边界条件
-          double p0 = d0;
-          double v0 = d_prime0 * target_s;
-          double a0 = 0.0;
-          double p1 = lat;
-          double v1 = 0.0;
-          double a1 = 0.0;
-
-          auto calc_quintic_coeffs = [](double p0, double v0, double a0, double p1, double v1, double a1) {
-              std::vector<double> c(6);
-              c[0] = p0;
-              c[1] = v0;
-              c[2] = a0 / 2.0;
-              c[3] = 10*(p1 - p0) - 6*v0 - 4*v1 - 1.5*a0 + 0.5*a1;
-              c[4] = -15*(p1 - p0) + 8*v0 + 7*v1 + 1.5*a0 - a1;
-              c[5] = 6*(p1 - p0) - 3*v0 - 3*v1 - 0.5*a0 + 0.5*a1;
-              return c;
-          };
-
-          auto C = calc_quintic_coeffs(p0, v0, a0, p1, v1, a1);
-
-          nav_msgs::msg::Path candidate_path;
-          candidate_path.header = base_plan.header;
+          double d = 0.0;
+          double d_prime_u = 0.0;
           
-          bool collision = false;
-          double obs_cost_sum = 0.0;
-          double smooth_cost_sum = 0.0;
-
-          int num_samples = 20; 
-          for (int i = 0; i <= num_samples; ++i) {
-              double u = static_cast<double>(i) / num_samples;
-              double s_i = u * target_s;
-              
-              double u2 = u*u, u3 = u2*u, u4 = u3*u, u5 = u4*u;
-              double d = C[0] + C[1]*u + C[2]*u2 + C[3]*u3 + C[4]*u4 + C[5]*u5;
-              double d_prime_u = C[1] + 2*C[2]*u + 3*C[3]*u2 + 4*C[4]*u3 + 5*C[5]*u4;
-              double d_prime = d_prime_u / target_s;
-              
-              // 基于参考路径映射回笛卡尔坐标系
-              auto ref_pose = get_ref_state(s_i);
-              double ref_x = ref_pose.pose.position.x;
-              double ref_y = ref_pose.pose.position.y;
-              double ref_theta = tf2::getYaw(ref_pose.pose.orientation);
-              
-              double x = ref_x - d * std::sin(ref_theta);
-              double y = ref_y + d * std::cos(ref_theta);
-              double theta = ref_theta + std::atan(d_prime);
-              
-              double cost = checker.footprintCostAtPose(x, y, theta, footprint);
-              if (cost >= nav2_costmap_2d::LETHAL_OBSTACLE) { 
-                  collision = true;
-                  break;
-              }
-              if (cost >= 0) {
-                 obs_cost_sum += cost;
-              }
-
-              geometry_msgs::msg::PoseStamped p;
-              p.header = base_plan.header;
-              p.pose.position.x = x;
-              p.pose.position.y = y;
-              tf2::Quaternion q;
-              q.setRPY(0, 0, theta);
-              p.pose.orientation.x = q.x();
-              p.pose.orientation.y = q.y();
-              p.pose.orientation.z = q.z();
-              p.pose.orientation.w = q.w();
-              candidate_path.poses.push_back(p);
+          for (int j = 0; j < n_cp; ++j) {
+              d += CP[j] * B[i][j];
+              d_prime_u += CP[j] * B_prime[i][j];
+          }
+          
+          double d_prime = d_prime_u / S_max;
+          
+          // 基于参考路径映射回笛卡尔坐标系
+          auto ref_pose = get_ref_state(s_i);
+          double ref_x = ref_pose.pose.position.x;
+          double ref_y = ref_pose.pose.position.y;
+          double ref_theta = tf2::getYaw(ref_pose.pose.orientation);
+          
+          double x = ref_x - d * std::sin(ref_theta);
+          double y = ref_y + d * std::cos(ref_theta);
+          double theta = ref_theta + std::atan(d_prime);
+          
+          double cost = checker.footprintCostAtPose(x, y, theta, footprint);
+          if (cost >= nav2_costmap_2d::LETHAL_OBSTACLE) { 
+              collision = true;
+              break;
+          }
+          if (cost >= 0) {
+              obs_cost_sum += cost;
           }
 
-          if (collision) {
-              candidates.push_back({candidate_path, std::numeric_limits<double>::max(), true, lat, 0.0, 0.0, 0.0});
-              continue;
-          }
-
-          for (size_t i = 1; i < candidate_path.poses.size(); ++i) {
-              double th1 = tf2::getYaw(candidate_path.poses[i-1].pose.orientation);
-              double th2 = tf2::getYaw(candidate_path.poses[i].pose.orientation);
-              double dth = th2 - th1;
-              while (dth > M_PI) dth -= 2.0 * M_PI;
-              while (dth < -M_PI) dth += 2.0 * M_PI;
-              
-              double dx_pt = candidate_path.poses[i].pose.position.x - candidate_path.poses[i-1].pose.position.x;
-              double dy_pt = candidate_path.poses[i].pose.position.y - candidate_path.poses[i-1].pose.position.y;
-              double dist = std::hypot(dx_pt, dy_pt);
-              
-              double kappa = (dist > 1e-3) ? dth / dist : 0.0;
-              smooth_cost_sum += kappa * kappa;
-          }
-
-          candidates.push_back({candidate_path, 0.0, false, lat, obs_cost_sum, smooth_cost_sum, target_s});
+          geometry_msgs::msg::PoseStamped p;
+          p.header = base_plan.header;
+          p.pose.position.x = x;
+          p.pose.position.y = y;
+          tf2::Quaternion q;
+          q.setRPY(0, 0, theta);
+          p.pose.orientation.x = q.x();
+          p.pose.orientation.y = q.y();
+          p.pose.orientation.z = q.z();
+          p.pose.orientation.w = q.w();
+          candidate_path.poses.push_back(p);
       }
+
+      if (collision) {
+          candidates.push_back({candidate_path, std::numeric_limits<double>::max(), true, lat_combo.back(), 0.0, 0.0, 0.0});
+          continue;
+      }
+
+      for (size_t i = 1; i < candidate_path.poses.size(); ++i) {
+          double th1 = tf2::getYaw(candidate_path.poses[i-1].pose.orientation);
+          double th2 = tf2::getYaw(candidate_path.poses[i].pose.orientation);
+          double dth = th2 - th1;
+          while (dth > M_PI) dth -= 2.0 * M_PI;
+          while (dth < -M_PI) dth += 2.0 * M_PI;
+          
+          double dx_pt = candidate_path.poses[i].pose.position.x - candidate_path.poses[i-1].pose.position.x;
+          double dy_pt = candidate_path.poses[i].pose.position.y - candidate_path.poses[i-1].pose.position.y;
+          double dist = std::hypot(dx_pt, dy_pt);
+          
+          double kappa = (dist > 1e-3) ? dth / dist : 0.0;
+          smooth_cost_sum += kappa * kappa;
+      }
+
+      candidates.push_back({candidate_path, 0.0, false, lat_combo.back(), obs_cost_sum, smooth_cost_sum, S_max});
   }
 
   // 4. 对所有候选曲线的各项成本进行归一化，并计算总分
@@ -310,8 +402,8 @@ nav_msgs::msg::Path MPCController::generateLatticePlan(
 
   // 打印最佳曲线得分及其偏移量
   if (best_idx != -1) {
-      RCLCPP_INFO(logger_, "Best Lattice Path: lat offset = %.2fm, score = %.3f", 
-                  candidates[best_idx].lat, candidates[best_idx].score);
+    //   RCLCPP_INFO(logger_, "Best Lattice Path: lat offset = %.2fm, score = %.3f", 
+    //               candidates[best_idx].lat, candidates[best_idx].score);
   } else {
       RCLCPP_WARN(logger_, "All Lattice Candidates in collision!");
   }
