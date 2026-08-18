@@ -1,7 +1,84 @@
 #include <mpc_controller.hpp>
 #include <limits>
+#include <vector>
+#include <algorithm>
+#include <cmath>
+#include <iterator>
 #include "nav2_costmap_2d/costmap_2d_ros.hpp"
 #include "nav2_costmap_2d/costmap_2d.hpp"
+
+namespace
+{
+class CubicSpline1D {
+public:
+  bool build(const std::vector<double>& s, const std::vector<double>& a_val) {
+    int n = s.size();
+    if (n < 3) return false;
+    a = a_val;
+    b.resize(n - 1);
+    c.resize(n, 0.0);
+    d.resize(n - 1);
+    s_vec = s;
+
+    std::vector<double> h(n - 1);
+    for (int i = 0; i < n - 1; ++i) {
+      h[i] = s[i + 1] - s[i];
+      if (h[i] <= 1e-6) return false;
+    }
+
+    std::vector<double> A(n, 0.0), B(n, 0.0), C(n, 0.0), D(n, 0.0);
+    for (int i = 1; i < n - 1; ++i) {
+      A[i] = h[i - 1];
+      B[i] = 2.0 * (h[i - 1] + h[i]);
+      C[i] = h[i];
+      D[i] = 3.0 * ((a[i + 1] - a[i]) / h[i] - (a[i] - a[i - 1]) / h[i - 1]);
+    }
+
+    std::vector<double> c_tmp(n, 0.0);
+    for (int i = 1; i < n - 1; ++i) {
+      double m = 1.0 / (B[i] - A[i] * c_tmp[i - 1]);
+      c_tmp[i] = C[i] * m;
+      D[i] = (D[i] - A[i] * D[i - 1]) * m;
+    }
+    for (int i = n - 2; i >= 1; --i) {
+      c[i] = D[i] - c_tmp[i] * c[i + 1];
+    }
+
+    for (int i = 0; i < n - 1; ++i) {
+      d[i] = (c[i + 1] - c[i]) / (3.0 * h[i]);
+      b[i] = (a[i + 1] - a[i]) / h[i] - h[i] * (2.0 * c[i] + c[i + 1]) / 3.0;
+    }
+    return true;
+  }
+
+  double calc_a(double s_query) const { return eval(s_query, 0); }
+  double calc_d1(double s_query) const { return eval(s_query, 1); }
+  double calc_d2(double s_query) const { return eval(s_query, 2); }
+
+private:
+  double eval(double query_s, int deriv_order) const {
+    int n = s_vec.size();
+    if (query_s <= s_vec.front()) query_s = s_vec.front();
+    if (query_s >= s_vec.back()) query_s = s_vec.back();
+
+    auto it = std::upper_bound(s_vec.begin(), s_vec.end(), query_s);
+    int idx = std::max(0, static_cast<int>(std::distance(s_vec.begin(), it)) - 1);
+    if (idx >= n - 1) idx = n - 2;
+
+    double ds = query_s - s_vec[idx];
+    if (deriv_order == 0) {
+      return a[idx] + b[idx] * ds + c[idx] * ds * ds + d[idx] * ds * ds * ds;
+    } else if (deriv_order == 1) {
+      return b[idx] + 2.0 * c[idx] * ds + 3.0 * d[idx] * ds * ds;
+    } else if (deriv_order == 2) {
+      return 2.0 * c[idx] + 6.0 * d[idx] * ds;
+    }
+    return 0.0;
+  }
+
+  std::vector<double> a, b, c, d, s_vec;
+};
+} // namespace
 
 namespace nav2_mpc_controller
 {
@@ -39,11 +116,9 @@ namespace nav2_mpc_controller
         for (size_t i = closest_idx; i < transformed_plan.poses.size(); ++i) {
             const auto & p = transformed_plan.poses[i];
             unsigned int mx, my;
-            // 检查点是否在代价地图范围内
             if (costmap->worldToMap(p.pose.position.x, p.pose.position.y, mx, my)) {
                 local_plan.poses.push_back(p);
             } else {
-                // 若超出代价地图范围，则停止截取以保持局部路径在已知区域内连续
                 break;
             }
         }
@@ -55,113 +130,74 @@ namespace nav2_mpc_controller
         double current_speed)
     {
     std::vector<TrajectoryPoint> ref_traj;
-    int M = local_plan.poses.size();
+    int M_raw = local_plan.poses.size();
     
-    if (M < 2) {
-        return ref_traj; // 路径太短，直接返回空
+    if (M_raw < 2) {
+        return ref_traj;
     }
 
-    // 1. 提取原始路径点
-    std::vector<PathPoint> path_points(M);
-    for (int i = 0; i < M; ++i) {
-        path_points[i].x = local_plan.poses[i].pose.position.x;
-        path_points[i].y = local_plan.poses[i].pose.position.y;
-        path_points[i].theta = tf2::getYaw(local_plan.poses[i].pose.orientation);
-    }
+    // 1. 提取去重后的原始路径点，并计算累积弧长 s
+    std::vector<double> raw_x, raw_y, raw_s;
+    raw_x.push_back(local_plan.poses[0].pose.position.x);
+    raw_y.push_back(local_plan.poses[0].pose.position.y);
+    raw_s.push_back(0.0);
 
-    // 1.5 针对原始 A* 等非平滑路径进行带数据保形约束的平滑 (Data-Constrained Smoothing)
-    if (!use_local_plan_) {
-        // 备份原始路径点，用于提供保形引力
-        std::vector<PathPoint> original_points = path_points;
-        
-        int smooth_iterations = 30; // 增加迭代次数以彻底消除曲率毛刺
-        double alpha = 0.3;         // 平滑权重 (拉向相邻点中点)
-        double beta = 0.2;          // 保形权重 (拉回原始路径的力度，防止切内弯)
-        
-        for (int iter = 0; iter < smooth_iterations; ++iter) {
-            for (int i = 1; i < M - 1; ++i) {
-                double smooth_dx = path_points[i-1].x + path_points[i+1].x - 2.0 * path_points[i].x;
-                double smooth_dy = path_points[i-1].y + path_points[i+1].y - 2.0 * path_points[i].y;
-                
-                double data_dx = original_points[i].x - path_points[i].x;
-                double data_dy = original_points[i].y - path_points[i].y;
-
-                path_points[i].x += alpha * smooth_dx + beta * data_dx;
-                path_points[i].y += alpha * smooth_dy + beta * data_dy;
-            }
-        }
-        
-        // 使用中心差分重新计算平滑后的朝向 (theta)，保留 path_points[0].theta 为当前机器人的真实朝向
-        for (int i = 1; i < M - 1; ++i) {
-            double dx = path_points[i+1].x - path_points[i-1].x;
-            double dy = path_points[i+1].y - path_points[i-1].y;
-            if (std::hypot(dx, dy) > 1e-4) {
-                path_points[i].theta = std::atan2(dy, dx);
-            }
-        }
-        double dx_end = path_points[M-1].x - path_points[M-2].x;
-        double dy_end = path_points[M-1].y - path_points[M-2].y;
-        if (std::hypot(dx_end, dy_end) > 1e-4) {
-            path_points[M-1].theta = std::atan2(dy_end, dx_end);
+    for (int i = 1; i < M_raw; ++i) {
+        double px = local_plan.poses[i].pose.position.x;
+        double py = local_plan.poses[i].pose.position.y;
+        double dx = px - raw_x.back();
+        double dy = py - raw_y.back();
+        double dist = std::hypot(dx, dy);
+        if (dist > 1e-3) {
+            raw_x.push_back(px);
+            raw_y.push_back(py);
+            raw_s.push_back(raw_s.back() + dist);
         }
     }
 
-    // 1.6 重新计算累积弧长 (s)
-    path_points[0].s = 0.0;
-    for (int i = 1; i < M; ++i) {
-        double dx = path_points[i].x - path_points[i-1].x;
-        double dy = path_points[i].y - path_points[i-1].y;
-        path_points[i].s = path_points[i-1].s + std::hypot(dx, dy);
+    int M = raw_s.size();
+    if (M < 3) {
+        return ref_traj;
     }
 
-    // 2. 利用运动学朝向精确计算离散曲率 (kappa = d_theta / ds)
-    // 彻底摒弃高阶多项式带来的龙格震荡灾难
-    for (int i = 0; i < M; ++i) {
-        if (i == 0 || i == M - 1) {
-            path_points[i].kappa = 0.0;
-        } else {
-            double th1 = path_points[i-1].theta;
-            double th2 = path_points[i+1].theta;
-            double dth = th2 - th1;
-            while (dth > M_PI) dth -= 2.0 * M_PI;
-            while (dth < -M_PI) dth += 2.0 * M_PI;
-            
-            double ds = path_points[i+1].s - path_points[i-1].s;
-            path_points[i].kappa = (ds > 1e-4) ? (dth / ds) : 0.0;
-        }
+    // 2. 构建 C2 自然三次样条插值器 (Cubic B-Spline)
+    CubicSpline1D spline_x, spline_y;
+    if (!spline_x.build(raw_s, raw_x) || !spline_y.build(raw_s, raw_y)) {
+        return ref_traj;
     }
 
-    // 3. 几何稠密化重采样 (最高 0.02m 分辨率)，为 Profiler 提供安全且无震荡的路径积分空间
-    double max_ds = 0.02; 
+    // 3. 几何 C2 高精采样 (0.05m 分辨率解析计算位置、姿态及解析曲率)
+    double total_s = raw_s.back();
+    double max_ds = 0.05;
     std::vector<PathPoint> dense_points;
-    dense_points.push_back(path_points[0]);
-    
-    for (int i = 1; i < M; ++i) {
-        double ds = path_points[i].s - path_points[i-1].s;
-        if (ds > max_ds) {
-            int num_inserts = std::floor(ds / max_ds);
-            for (int j = 1; j <= num_inserts; ++j) {
-                double ratio = static_cast<double>(j) / (num_inserts + 1.0);
-                PathPoint pt;
-                pt.x = path_points[i-1].x + ratio * (path_points[i].x - path_points[i-1].x);
-                pt.y = path_points[i-1].y + ratio * (path_points[i].y - path_points[i-1].y);
-                
-                double th1 = path_points[i-1].theta;
-                double th2 = path_points[i].theta;
-                double dth = th2 - th1;
-                while (dth > M_PI) dth -= 2.0 * M_PI;
-                while (dth < -M_PI) dth += 2.0 * M_PI;
-                pt.theta = th1 + ratio * dth;
-                
-                pt.kappa = path_points[i-1].kappa + ratio * (path_points[i].kappa - path_points[i-1].kappa);
-                pt.s = path_points[i-1].s + ratio * ds;
-                dense_points.push_back(pt);
-            }
+
+    for (double s = 0.0; s <= total_s; s += max_ds) {
+        PathPoint pt;
+        pt.s = s;
+        pt.x = spline_x.calc_a(s);
+        pt.y = spline_y.calc_a(s);
+
+        double dx_ds = spline_x.calc_d1(s);
+        double dy_ds = spline_y.calc_d1(s);
+        double d2x_ds2 = spline_x.calc_d2(s);
+        double d2y_ds2 = spline_y.calc_d2(s);
+
+        double speed_s = std::hypot(dx_ds, dy_ds);
+        if (speed_s > 1e-4) {
+            pt.theta = std::atan2(dy_ds, dx_ds);
+            pt.kappa = (dx_ds * d2y_ds2 - dy_ds * d2x_ds2) / (speed_s * speed_s * speed_s);
+        } else {
+            pt.theta = 0.0;
+            pt.kappa = 0.0;
         }
-        dense_points.push_back(path_points[i]);
+        dense_points.push_back(pt);
     }
 
-    // 4. 利用 Profiler 进行速度与时间规划
+    if (dense_points.size() < 2) {
+        return ref_traj;
+    }
+
+    // 4. 利用 Profiler 进行速度与时间参数化
     trajectory_profiler_->generate_profile(dense_points, current_speed);
 
     // 5. 等 dt 获取 N 步采样点 (已内嵌精确插值)

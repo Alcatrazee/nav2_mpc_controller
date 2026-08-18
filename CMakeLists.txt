@@ -58,7 +58,6 @@ add_library(${library_name} SHARED
         src/transform_tools.cpp
         src/ref_trajectory_generator.cpp
         src/trajectory_profiler.cpp
-        src/local_planner.cpp
         src/viz_function.cpp)
 
 ament_target_dependencies(${library_name}

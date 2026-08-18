@@ -20,10 +20,9 @@
 #include "nav2_util/node_utils.hpp"
 #include <tf2_ros/transform_listener.hpp>
 #include <tf2_ros/buffer.h>
-#include "rcl_interfaces/msg/set_parameters_result.hpp"
+#include "std_msgs/msg/float64.hpp"
 #include "trajectory_profiler.hpp"
 #include <Eigen/Dense>
-#include "nav2_costmap_2d/footprint_collision_checker.hpp"
 
 
 namespace nav2_mpc_controller
@@ -66,7 +65,7 @@ private:
   rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>::SharedPtr transformed_local_plan_pub_;
   rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>::SharedPtr local_plan_pub_;
   rclcpp_lifecycle::LifecyclePublisher<visualization_msgs::msg::MarkerArray>::SharedPtr local_plan_marker_pub_;
-  rclcpp_lifecycle::LifecyclePublisher<visualization_msgs::msg::MarkerArray>::SharedPtr lattice_candidates_pub_;
+  rclcpp_lifecycle::LifecyclePublisher<std_msgs::msg::Float64>::SharedPtr lateral_error_pub_;
   nav_msgs::msg::Path global_plan_;
 
   // MPC 参数
@@ -78,35 +77,14 @@ private:
   double w_min_;         // 最小角速度
   double a_max_;         // 最大线加速度
   double a_min_;         // 最小线加速度
-  double max_lat_accel_; // 最大侧向加速度
-  double accel_ratio_;   // 规划器加速比例 (0.0 ~ 1.0)
-  double decel_ratio_;   // 规划器减速比例 (0.0 ~ 1.0)
   
-  // 权重参数
-  double q_x_;
-  double q_y_;
-  double q_theta_;
+  // Frenet 状态与控制量权重
+  double q_s_;
+  double q_d_;
+  double q_e_psi_;
   double r_v_;
   double r_w_;
   double r_a_;
-  double weight_turn_radius_;
-  double min_turning_radius_;
-  double cmd_vel_filter_alpha_; // 输出指令的一阶低通滤波系数
-  
-  // Lattice Planner 参数
-  bool use_local_plan_;
-  double lattice_base_lookahead_dist_;
-  double lattice_max_lookahead_dist_;
-  double lattice_lookahead_time_;
-  double lattice_lookahead_dist_; // 动态计算的当前前瞻距离
-  double lattice_lat_range_;
-  double lattice_lat_step_;
-  std::vector<double> lattice_lon_ratios_;
-  double weight_obs_;
-  double weight_lat_;
-  double weight_smooth_;
-  double weight_lat_change_;  // 横向跳变惩罚权重 (保证时序一致性)
-  double prev_best_lat_{0.0}; // 记录上一帧的最优横向偏移量
 
   // 动态参数调整
   std::mutex param_mutex_;
@@ -115,53 +93,50 @@ private:
 
   std::unique_ptr<TrajectoryProfiler> trajectory_profiler_;
 
-  // 新增的时间参数化核心函数
+  // 时间参数化核心函数
   std::vector<TrajectoryPoint> generateTimeParameterizedTrajectory(
     const nav_msgs::msg::Path & local_plan, 
     double current_speed);
-
-  // 新增的最简 Lattice Planner，用于生成候选曲线并结合障碍物评价选出最优轨迹
-  nav_msgs::msg::Path generateLatticePlan(
-    const geometry_msgs::msg::PoseStamped & pose,
-    const nav_msgs::msg::Path & base_plan,
-    nav2_costmap_2d::FootprintCollisionChecker<nav2_costmap_2d::Costmap2D *> & checker,
-    bool is_plan_contain_goal);
 
   // 将速度参数化后的局部路径及MarkerArray发布到可视化话题的辅助函数
   void publishParameterizedTrajectory(
     const std::vector<TrajectoryPoint> & ref_points,
     const std_msgs::msg::Header & header);
 
-  // CasADi MPC 优化器属性及参数
-  casadi::Opti opti_;
-  casadi::MX X_;
-  casadi::MX U_;
-  casadi::MX X0_param_;
-  casadi::MX Ref_x_param_;
-  casadi::MX Ref_y_param_;
-  casadi::MX Ref_theta_param_;
-  casadi::MX Ref_v_param_;
-  casadi::MX Ref_w_param_;
+  // CasADi MPC 优化器及预编译 Function 函数
+  casadi::Function mpc_solver_;
+
   bool mpc_problem_initialized_{false};
   bool is_cold_start_{true};
   
-  nav_msgs::msg::Path prev_local_plan_; // 保存上一帧的局部路径
+  double prev_cmd_w_{0.0};
 
-  // 用于 Warm Start 存储上一帧的结果
-  std::vector<double> prev_x_sol_;
-  std::vector<double> prev_y_sol_;
-  std::vector<double> prev_theta_sol_;
+  // 用于存储上一帧的 Frenet 状态解
+  std::vector<double> prev_s_sol_;
+  std::vector<double> prev_d_sol_;
+  std::vector<double> prev_e_psi_sol_;
   std::vector<double> prev_v_sol_;
   std::vector<double> prev_w_sol_;
   std::vector<double> prev_a_sol_;
 
-  // 用于低通滤波缓存的上一帧速度指令
-  double last_cmd_v_{0.0};
-  double last_cmd_w_{0.0};
+  struct FrenetState
+  {
+    double s;
+    double d;
+    double e_psi;
+  };
+
+  FrenetState cartesianToFrenet(
+    double x, double y, double theta,
+    const std::vector<TrajectoryPoint> & reference_path) const;
+
+  geometry_msgs::msg::Pose frenetToCartesian(
+    double s, double d, double e_psi,
+    const std::vector<TrajectoryPoint> & reference_path) const;
 
   void initializeMPC();
   // 角度归一化辅助函数
-  double normalize_angle(double angle)
+  double normalize_angle(double angle) const
   {
     while (angle > M_PI) angle -= 2.0 * M_PI;
     while (angle < -M_PI) angle += 2.0 * M_PI;
