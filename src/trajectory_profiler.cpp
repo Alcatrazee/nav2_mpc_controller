@@ -46,7 +46,7 @@ void TrajectoryProfiler::generate_profile(const std::vector<PathPoint> & path, d
   }
 
   // Step 3: Backward Kinematic Pass (Deceleration)
-  v_final[N - 1] = 0.0; // Assume full stop at the goal
+  v_final[N - 1] = 0.05; // 保持保底参考速度 0.05m/s 直至终点，防止预测时域后半段全部塌陷为 0 导致提前熄火
   for (int i = static_cast<int>(N) - 2; i >= 0; --i) {
     double ds = path[i + 1].s - path[i].s;
     if (ds < 0.0) ds = 0.0;

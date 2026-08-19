@@ -58,6 +58,7 @@ add_library(${library_name} SHARED
         src/transform_tools.cpp
         src/ref_trajectory_generator.cpp
         src/trajectory_profiler.cpp
+        src/safe_corridor_generator.cpp
         src/viz_function.cpp)
 
 ament_target_dependencies(${library_name}
@@ -65,14 +66,30 @@ ament_target_dependencies(${library_name}
 )
 target_link_libraries(${library_name} casadi)
 
-install(TARGETS ${library_name}
+add_executable(safe_corridor_demo_node src/safe_corridor_demo_node.cpp)
+target_link_libraries(safe_corridor_demo_node ${library_name})
+ament_target_dependencies(safe_corridor_demo_node ${dependencies})
+
+add_executable(test_corridor test_corridor.cpp)
+target_link_libraries(test_corridor ${library_name})
+ament_target_dependencies(test_corridor ${dependencies})
+
+add_executable(test_costmap_corridor test_costmap_corridor.cpp)
+target_link_libraries(test_costmap_corridor ${library_name})
+ament_target_dependencies(test_costmap_corridor ${dependencies})
+
+install(TARGETS ${library_name} safe_corridor_demo_node test_corridor test_costmap_corridor
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
-  RUNTIME DESTINATION bin
+  RUNTIME DESTINATION lib/${PROJECT_NAME}
 )
 
 install(DIRECTORY include/
   DESTINATION include/
+)
+
+install(DIRECTORY params/
+  DESTINATION share/${PROJECT_NAME}/params
 )
 
 # install plugin description

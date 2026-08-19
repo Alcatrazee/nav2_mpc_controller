@@ -22,6 +22,7 @@
 #include <tf2_ros/buffer.h>
 #include "std_msgs/msg/float64.hpp"
 #include "trajectory_profiler.hpp"
+#include "safe_corridor_generator.hpp"
 #include <Eigen/Dense>
 
 
@@ -52,6 +53,8 @@ public:
   void setPlan(const nav_msgs::msg::Path & path) override;
   void setSpeedLimit(const double & speed_limit, const bool & percentage) override;
 
+  const SafeCorridor & getSafeCorridor() const { return current_safe_corridor_; }
+
 private:
   // ROS 和 Nav2 基础设施
   rclcpp_lifecycle::LifecycleNode::WeakPtr node_;
@@ -65,8 +68,31 @@ private:
   rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>::SharedPtr transformed_local_plan_pub_;
   rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>::SharedPtr local_plan_pub_;
   rclcpp_lifecycle::LifecyclePublisher<visualization_msgs::msg::MarkerArray>::SharedPtr local_plan_marker_pub_;
+  rclcpp_lifecycle::LifecyclePublisher<visualization_msgs::msg::MarkerArray>::SharedPtr safe_corridor_marker_pub_;
   rclcpp_lifecycle::LifecyclePublisher<std_msgs::msg::Float64>::SharedPtr lateral_error_pub_;
   nav_msgs::msg::Path global_plan_;
+
+  // 安全走廊生成器与配置
+  SafeCorridorConfig corridor_config_;
+  std::unique_ptr<SafeCorridorGenerator> safe_corridor_generator_;
+  SafeCorridor current_safe_corridor_;
+  bool enable_safe_corridor_{true};
+  double q_corridor_bound_{35.0};
+  double q_corridor_center_{30.0};    // 窄通道宽度自适应居中势场权重
+  double w_corridor_slack_{1000.0};
+  double corridor_buffer_margin_{0.1};
+
+  // 终点位姿硬约束与终端代价参数
+  bool enable_terminal_constraint_{true};
+  double goal_approach_dist_{0.6};    // 进入终点进近模式的距离阈值 [m]
+  double terminal_s_tol_{0.05};        // 终点纵向位置硬约束容差 [m]
+  double terminal_d_tol_{0.03};        // 终点横向偏差硬约束容差 [m]
+  double terminal_epsi_tol_{0.05};     // 终点航向角误差硬约束容差 [rad]
+  double terminal_v_tol_{0.01};        // 终点速度硬约束容差 [m/s]
+  double q_s_terminal_{10.0};          // 终端纵向代价权重
+  double q_d_terminal_{50.0};          // 终端横向代价权重
+  double q_epsi_terminal_{20.0};       // 终端航向代价权重
+  double r_v_terminal_{10.0};          // 终端速度代价权重
 
   // MPC 参数
   int N_;                // 预测步数
@@ -135,6 +161,8 @@ private:
     const std::vector<TrajectoryPoint> & reference_path) const;
 
   void initializeMPC();
+  bool checkGoalCollision(double check_x, double check_y, double check_theta) const;
+
   // 角度归一化辅助函数
   double normalize_angle(double angle) const
   {

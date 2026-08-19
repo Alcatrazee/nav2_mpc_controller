@@ -111,9 +111,10 @@ namespace nav2_mpc_controller
             }
         }
 
-        // 2. 截取最近点之后的点，并保证在 costmap 范围内
+        // 2. 截取最近点前后的点，并保证在 costmap 范围内 (向前回退3个点以确保终点处点数充足)
+        size_t start_idx = (closest_idx >= 3) ? (closest_idx - 3) : 0;
         auto * costmap = costmap_ros->getCostmap();
-        for (size_t i = closest_idx; i < transformed_plan.poses.size(); ++i) {
+        for (size_t i = start_idx; i < transformed_plan.poses.size(); ++i) {
             const auto & p = transformed_plan.poses[i];
             unsigned int mx, my;
             if (costmap->worldToMap(p.pose.position.x, p.pose.position.y, mx, my)) {
@@ -132,7 +133,7 @@ namespace nav2_mpc_controller
     std::vector<TrajectoryPoint> ref_traj;
     int M_raw = local_plan.poses.size();
     
-    if (M_raw < 2) {
+    if (M_raw == 0) {
         return ref_traj;
     }
 
@@ -155,46 +156,88 @@ namespace nav2_mpc_controller
         }
     }
 
-    int M = raw_s.size();
-    if (M < 3) {
-        return ref_traj;
-    }
-
-    // 2. 构建 C2 自然三次样条插值器 (Cubic B-Spline)
-    CubicSpline1D spline_x, spline_y;
-    if (!spline_x.build(raw_s, raw_x) || !spline_y.build(raw_s, raw_y)) {
-        return ref_traj;
-    }
-
-    // 3. 几何 C2 高精采样 (0.05m 分辨率解析计算位置、姿态及解析曲率)
-    double total_s = raw_s.back();
-    double max_ds = 0.05;
     std::vector<PathPoint> dense_points;
 
-    for (double s = 0.0; s <= total_s; s += max_ds) {
-        PathPoint pt;
-        pt.s = s;
-        pt.x = spline_x.calc_a(s);
-        pt.y = spline_y.calc_a(s);
-
-        double dx_ds = spline_x.calc_d1(s);
-        double dy_ds = spline_y.calc_d1(s);
-        double d2x_ds2 = spline_x.calc_d2(s);
-        double d2y_ds2 = spline_y.calc_d2(s);
-
-        double speed_s = std::hypot(dx_ds, dy_ds);
-        if (speed_s > 1e-4) {
-            pt.theta = std::atan2(dy_ds, dx_ds);
-            pt.kappa = (dx_ds * d2y_ds2 - dy_ds * d2x_ds2) / (speed_s * speed_s * speed_s);
-        } else {
-            pt.theta = 0.0;
-            pt.kappa = 0.0;
+    // 2. 点数不足 3 个时的鲁棒高密保底插值 (终点极近进近保障)
+    if (raw_s.size() < 3) {
+        if (raw_s.size() == 1) {
+            // 仅剩终点 1 点: 沿目标方向构建微小引导线段
+            double th = tf2::getYaw(local_plan.poses.back().pose.orientation);
+            double x0 = raw_x.front();
+            double y0 = raw_y.front();
+            for (int step = 0; step < 5; ++step) {
+                PathPoint pt;
+                pt.s = step * 0.05;
+                pt.x = x0 + pt.s * std::cos(th);
+                pt.y = y0 + pt.s * std::sin(th);
+                pt.theta = th;
+                pt.kappa = 0.0;
+                dense_points.push_back(pt);
+            }
+        } else if (raw_s.size() == 2) {
+            // 2 个点: 沿线段线性高密插值
+            double x0 = raw_x[0], y0 = raw_y[0];
+            double x1 = raw_x[1], y1 = raw_y[1];
+            double seg_len = std::max(0.01, raw_s[1]);
+            double th = std::atan2(y1 - y0, x1 - x0);
+            for (double s = 0.0; s <= seg_len + 1e-4; s += 0.02) {
+                double r = std::clamp(s / seg_len, 0.0, 1.0);
+                PathPoint pt;
+                pt.s = s;
+                pt.x = x0 + r * (x1 - x0);
+                pt.y = y0 + r * (y1 - y0);
+                pt.theta = th;
+                pt.kappa = 0.0;
+                dense_points.push_back(pt);
+            }
         }
-        dense_points.push_back(pt);
+    } else {
+        // 3. 构建 C2 自然三次样条插值器 (Cubic B-Spline)
+        CubicSpline1D spline_x, spline_y;
+        if (spline_x.build(raw_s, raw_x) && spline_y.build(raw_s, raw_y)) {
+            double total_s = raw_s.back();
+            double max_ds = 0.05;
+            for (double s = 0.0; s <= total_s; s += max_ds) {
+                PathPoint pt;
+                pt.s = s;
+                pt.x = spline_x.calc_a(s);
+                pt.y = spline_y.calc_a(s);
+
+                double dx_ds = spline_x.calc_d1(s);
+                double dy_ds = spline_y.calc_d1(s);
+                double d2x_ds2 = spline_x.calc_d2(s);
+                double d2y_ds2 = spline_y.calc_d2(s);
+
+                double speed_s = std::hypot(dx_ds, dy_ds);
+                if (speed_s > 1e-4) {
+                    pt.theta = std::atan2(dy_ds, dx_ds);
+                    pt.kappa = (dx_ds * d2y_ds2 - dy_ds * d2x_ds2) / (speed_s * speed_s * speed_s);
+                } else {
+                    pt.theta = 0.0;
+                    pt.kappa = 0.0;
+                }
+                dense_points.push_back(pt);
+            }
+        } else {
+            // 样条失败保底
+            for (size_t i = 0; i < raw_s.size(); ++i) {
+                PathPoint pt;
+                pt.s = raw_s[i];
+                pt.x = raw_x[i];
+                pt.y = raw_y[i];
+                pt.theta = (i + 1 < raw_s.size()) ? std::atan2(raw_y[i+1]-raw_y[i], raw_x[i+1]-raw_x[i]) : dense_points.back().theta;
+                pt.kappa = 0.0;
+                dense_points.push_back(pt);
+            }
+        }
     }
 
     if (dense_points.size() < 2) {
-        return ref_traj;
+        PathPoint pt2 = dense_points.front();
+        pt2.s += 0.05;
+        pt2.x += 0.05 * std::cos(pt2.theta);
+        pt2.y += 0.05 * std::sin(pt2.theta);
+        dense_points.push_back(pt2);
     }
 
     // 4. 利用 Profiler 进行速度与时间参数化
