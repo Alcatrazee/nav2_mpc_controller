@@ -154,11 +154,13 @@ private:
 
   FrenetState cartesianToFrenet(
     double x, double y, double theta,
-    const std::vector<TrajectoryPoint> & reference_path) const;
+    const std::vector<TrajectoryPoint> & reference_path,
+    bool is_reversing = false) const;
 
   geometry_msgs::msg::Pose frenetToCartesian(
     double s, double d, double e_psi,
-    const std::vector<TrajectoryPoint> & reference_path) const;
+    const std::vector<TrajectoryPoint> & reference_path,
+    bool is_reversing = false) const;
 
   void initializeMPC();
   bool checkGoalCollision(double check_x, double check_y, double check_theta) const;

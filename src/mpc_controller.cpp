@@ -326,7 +326,8 @@ rcl_interfaces::msg::SetParametersResult MPCController::dynamicParametersCallbac
 
 MPCController::FrenetState MPCController::cartesianToFrenet(
   double x, double y, double theta,
-  const std::vector<TrajectoryPoint> & reference_path) const
+  const std::vector<TrajectoryPoint> & reference_path,
+  bool is_reversing) const
 {
   if (reference_path.empty()) {
     return {0.0, 0.0, 0.0};
@@ -336,10 +337,11 @@ MPCController::FrenetState MPCController::cartesianToFrenet(
     const auto & ref = reference_path.front();
     const double dx = x - ref.x;
     const double dy = y - ref.y;
+    double ref_heading = is_reversing ? normalize_angle(ref.theta + M_PI) : ref.theta;
     return {
       ref.s,
       -dx * std::sin(ref.theta) + dy * std::cos(ref.theta),
-      normalize_angle(theta - ref.theta)};
+      normalize_angle(theta - ref_heading)};
   }
 
   double min_dist_sq = std::numeric_limits<double>::max();
@@ -374,12 +376,14 @@ MPCController::FrenetState MPCController::cartesianToFrenet(
     }
   }
 
-  return {best_s, best_d, normalize_angle(theta - best_theta)};
+  double ref_heading = is_reversing ? normalize_angle(best_theta + M_PI) : best_theta;
+  return {best_s, best_d, normalize_angle(theta - ref_heading)};
 }
 
 geometry_msgs::msg::Pose MPCController::frenetToCartesian(
   double s, double d, double e_psi,
-  const std::vector<TrajectoryPoint> & reference_path) const
+  const std::vector<TrajectoryPoint> & reference_path,
+  bool is_reversing) const
 {
   geometry_msgs::msg::Pose pose;
   if (reference_path.empty()) {
@@ -418,7 +422,8 @@ geometry_msgs::msg::Pose MPCController::frenetToCartesian(
     left->x + ratio * (right->x - left->x) + longitudinal_offset * std::cos(ref_theta);
   const double ref_y =
     left->y + ratio * (right->y - left->y) + longitudinal_offset * std::sin(ref_theta);
-  const double theta = normalize_angle(ref_theta + e_psi);
+  const double base_theta = is_reversing ? normalize_angle(ref_theta + M_PI) : ref_theta;
+  const double theta = normalize_angle(base_theta + e_psi);
 
   pose.position.x = ref_x - d * std::sin(ref_theta);
   pose.position.y = ref_y + d * std::cos(ref_theta);
@@ -654,7 +659,7 @@ geometry_msgs::msg::TwistStamped MPCController::computeVelocityCommands(
   
 
   // 一键生成带曲率平滑的时间参数化轨迹及控制参考点
-  auto ref_points = generateTimeParameterizedTrajectory(tracking_plan, current_speed);
+  auto ref_points = generateTimeParameterizedTrajectory(tracking_plan, std::abs(current_speed));
 
   if (ref_points.empty()) {
     RCLCPP_WARN_THROTTLE(logger_, *(node_.lock()->get_clock()), 1000, 
@@ -679,8 +684,16 @@ geometry_msgs::msg::TwistStamped MPCController::computeVelocityCommands(
     return cmd_vel;
   }
 
+  // 判定是否为倒车路径 (Reversing Path Detection):
+  // 1) 机器人当前航向角与参考路径起始切线方向偏差 > 90 度
+  // 2) 或局部规划路径起始位姿航向与参考路径起始切线方向偏差 > 90 度
+  double heading_to_path = normalize_angle(current_theta - reference_path.front().theta);
+  double plan_to_path = (!tracking_plan.poses.empty()) ? 
+    normalize_angle(tf2::getYaw(tracking_plan.poses.front().pose.orientation) - reference_path.front().theta) : 0.0;
+  bool is_reversing = (std::abs(heading_to_path) > M_PI_2 || std::abs(plan_to_path) > M_PI_2);
+
   const FrenetState current_frenet = cartesianToFrenet(
-    current_x, current_y, current_theta, reference_path);
+    current_x, current_y, current_theta, reference_path, is_reversing);
 
   // 发布实时横向偏差 d (单位: 米) 到话题 lateral_error
   std_msgs::msg::Float64 d_msg;
@@ -751,16 +764,21 @@ geometry_msgs::msg::TwistStamped MPCController::computeVelocityCommands(
     ref_w[k] = ref_v[k] * ref_kappa[k];
   }
 
-  // 1) 终点切向过冲判定 (Forward Overrun Check)
-  double goal_forward_proj = (current_x - goal_x) * std::cos(goal_yaw) + (current_y - goal_y) * std::sin(goal_yaw);
-  bool is_overshot = (goal_forward_proj > 0.02 && dist_to_goal < 0.30); // 冲过终点截面 2cm 判定为过冲
+  // 1) 终点切向进近过冲判定 (Overshoot Check along Approach Path Direction)
+  // 采用参考路径到达终点时的切向向量作为进近方向，计算沿进近方向的实际位移过冲量
+  // 无论正向还是倒车，未到达终点前 approach_proj < 0，绝不提前误判过冲导致在终点外原地旋转
+  double approach_theta = reference_path.back().theta;
+  double approach_proj = (current_x - goal_x) * std::cos(approach_theta) + 
+                         (current_y - goal_y) * std::sin(approach_theta);
+  bool is_overshot = (approach_proj > 0.02 && dist_to_goal < 0.30); // 沿进近方向冲过终点截面 2cm 判定为过冲
 
-  // 2) 终点与前方碰撞停障保护 (Goal / Impending Collision Stop Guard)
+  // 2) 终点与行进前方碰撞停障保护 (Goal / Impending Collision Stop Guard)
   bool is_goal_occupied = checkGoalCollision(goal_x, goal_y, goal_yaw);
-  double front_check_d = std::clamp(current_speed * 0.5, 0.10, 0.25);
+  double motion_yaw = is_reversing ? normalize_angle(current_theta + M_PI) : current_theta;
+  double front_check_d = std::clamp(std::abs(current_speed) * 0.5, 0.10, 0.25);
   bool is_front_occupied = checkGoalCollision(
-    current_x + front_check_d * std::cos(current_theta),
-    current_y + front_check_d * std::sin(current_theta),
+    current_x + front_check_d * std::cos(motion_yaw),
+    current_y + front_check_d * std::sin(motion_yaw),
     current_theta);
 
   if (is_front_occupied || (dist_to_goal < 0.35 && is_goal_occupied)) {
@@ -774,7 +792,7 @@ geometry_msgs::msg::TwistStamped MPCController::computeVelocityCommands(
   // 3) 超过终点或进入 5cm 容差圈立即停进 (Overshoot Stop Guard) 并执行原地对齐
   if (is_overshot || dist_to_goal < 0.05) {
     double angle_to_goal_orient = normalize_angle(goal_yaw - current_theta);
-    cmd_vel.twist.linear.x = 0.0; // 强制停止前进，绝对不继续前冲
+    cmd_vel.twist.linear.x = 0.0; // 强制停止前进/后退，绝对不继续前冲
     if (std::abs(angle_to_goal_orient) > 0.03) {
       double max_turn_w = 0.4;
       double rot_w = std::clamp(1.5 * angle_to_goal_orient, -max_turn_w, max_turn_w);
@@ -790,6 +808,9 @@ geometry_msgs::msg::TwistStamped MPCController::computeVelocityCommands(
   // 4) 无论偏离多远，靠近终点时直接向目标点坐标进发 (Goal Line-of-Sight Attraction)
   if (dist_to_goal < 1.20) {
     double los_yaw = std::atan2(goal_y - current_y, goal_x - current_x);
+    if (is_reversing) {
+      los_yaw = normalize_angle(los_yaw + M_PI);
+    }
     double direct_heading_err = normalize_angle(los_yaw - current_theta);
     double blend_factor = std::clamp((1.20 - dist_to_goal) / 1.20, 0.0, 0.75);
     for (int k = 0; k < N_; ++k) {
@@ -822,7 +843,7 @@ geometry_msgs::msg::TwistStamped MPCController::computeVelocityCommands(
     initializeMPC();
   }
 
-  double safe_current_speed = std::clamp(current_speed, v_min_, v_max_);
+  double safe_current_speed = std::clamp(std::abs(current_speed), 0.0, v_max_);
   std::vector<double> current_state = {
     current_frenet.s, current_frenet.d, current_frenet.e_psi, safe_current_speed};
 
@@ -880,7 +901,10 @@ geometry_msgs::msg::TwistStamped MPCController::computeVelocityCommands(
       output_v = 0.0;
     }
 
-    cmd_vel.twist.linear.x = std::clamp(output_v, v_min_, v_max_);
+    double final_v = is_reversing ? -output_v : output_v;
+    double lower_v_limit = is_reversing ? -v_max_ : v_min_;
+    double upper_v_limit = is_reversing ? (v_min_ < 0.0 ? v_min_ : 0.0) : v_max_;
+    cmd_vel.twist.linear.x = std::clamp(final_v, lower_v_limit, upper_v_limit);
     cmd_vel.twist.angular.z = filtered_w;
 
     nav_msgs::msg::Path predict_path;
@@ -894,7 +918,8 @@ geometry_msgs::msg::TwistStamped MPCController::computeVelocityCommands(
         double(sol_X(0, k)),
         double(sol_X(1, k)),
         double(sol_X(2, k)),
-        reference_path);
+        reference_path,
+        is_reversing);
       predict_path.poses.push_back(p);
     }
     traj_pub_->publish(predict_path);
