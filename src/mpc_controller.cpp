@@ -108,6 +108,8 @@ void MPCController::configure(
   node->get_parameter(plugin_name_ + ".q_epsi_terminal", q_epsi_terminal_);
   node->get_parameter(plugin_name_ + ".r_v_terminal", r_v_terminal_);
 
+  corridor_config_.goal_approach_dist = goal_approach_dist_;
+  corridor_config_.terminal_d_tol = terminal_d_tol_;
   safe_corridor_generator_ = std::make_unique<SafeCorridorGenerator>(corridor_config_);
 
   // 注册动态参数回调
@@ -280,10 +282,14 @@ rcl_interfaces::msg::SetParametersResult MPCController::dynamicParametersCallbac
       enable_terminal_constraint_ = parameter.as_bool();
     } else if (name == plugin_name_ + ".goal_approach_dist") {
       goal_approach_dist_ = parameter.as_double();
+      corridor_config_.goal_approach_dist = goal_approach_dist_;
+      update_corridor = true;
     } else if (name == plugin_name_ + ".terminal_s_tol") {
       terminal_s_tol_ = parameter.as_double();
     } else if (name == plugin_name_ + ".terminal_d_tol") {
       terminal_d_tol_ = parameter.as_double();
+      corridor_config_.terminal_d_tol = terminal_d_tol_;
+      update_corridor = true;
     } else if (name == plugin_name_ + ".terminal_epsi_tol") {
       terminal_epsi_tol_ = parameter.as_double();
     } else if (name == plugin_name_ + ".terminal_v_tol") {
@@ -664,15 +670,46 @@ geometry_msgs::msg::TwistStamped MPCController::computeVelocityCommands(
   viz_header.stamp = cmd_vel.header.stamp;
   publishParameterizedTrajectory(ref_points, viz_header);
 
+  // 提取 Frenet 参考路径与机器人当前 Frenet 状态
+  const auto & reference_path = trajectory_profiler_->get_trajectory();
+  if (reference_path.size() < 2) {
+    RCLCPP_WARN_THROTTLE(
+      logger_, *(node_.lock()->get_clock()), 1000,
+      "Frenet reference path is too short! Stopping robot.");
+    return cmd_vel;
+  }
+
+  const FrenetState current_frenet = cartesianToFrenet(
+    current_x, current_y, current_theta, reference_path);
+
+  // 发布实时横向偏差 d (单位: 米) 到话题 lateral_error
+  std_msgs::msg::Float64 d_msg;
+  d_msg.data = current_frenet.d;
+  lateral_error_pub_->publish(d_msg);
+
+  // 计算到最终目标点（Goal Pose）的空间几何关系与剩余弧长
+  double goal_x = transformed_plan.poses.back().pose.position.x;
+  double goal_y = transformed_plan.poses.back().pose.position.y;
+  double goal_yaw = tf2::getYaw(transformed_plan.poses.back().pose.orientation);
+  double dist_to_goal = std::hypot(goal_x - current_x, goal_y - current_y);
+
+  double last_plan_x = tracking_plan.poses.back().pose.position.x;
+  double last_plan_y = tracking_plan.poses.back().pose.position.y;
+  bool goal_reached_by_plan = (std::hypot(goal_x - last_plan_x, goal_y - last_plan_y) < 0.20);
+  double s_remain = (goal_reached_by_plan && reference_path.back().s > current_frenet.s)
+    ? (reference_path.back().s - current_frenet.s) : dist_to_goal;
+
   // 提取走廊横向边界序列
   std::vector<double> corridor_d_min(N_, -corridor_config_.default_right_width);
   std::vector<double> corridor_d_max(N_,  corridor_config_.default_left_width);
 
   if (enable_safe_corridor_) {
     // 1. 构建基于参考路线的安全走廊 (结合障碍物、曲率半径限制与掉头弯防自交叉)
+    // 传入到终点的剩余弧长 s_remain：未到终点时保持两边平行状态，接近终点最后进近阶段漏斗收拢
+    // 传入当前横向偏差 current_frenet.d：基于机器人当前位姿与连通性进行可达性扩散，不构建不可达一侧
     auto * costmap = (costmap_ros_ && corridor_config_.check_costmap) ? costmap_ros_->getCostmap() : nullptr;
     current_safe_corridor_ = safe_corridor_generator_->generateCorridor(
-      ref_points, costmap, pose.header.frame_id, cmd_vel.header.stamp);
+      ref_points, costmap, pose.header.frame_id, cmd_vel.header.stamp, s_remain, current_frenet.d);
 
     // 发布安全走廊 3D 网格、边界及截面肋线可视化 MarkerArray
     if (safe_corridor_marker_pub_ && safe_corridor_marker_pub_->is_activated()) {
@@ -703,22 +740,6 @@ geometry_msgs::msg::TwistStamped MPCController::computeVelocityCommands(
     }
   }
 
-  const auto & reference_path = trajectory_profiler_->get_trajectory();
-  if (reference_path.size() < 2) {
-    RCLCPP_WARN_THROTTLE(
-      logger_, *(node_.lock()->get_clock()), 1000,
-      "Frenet reference path is too short! Stopping robot.");
-    return cmd_vel;
-  }
-
-  const FrenetState current_frenet = cartesianToFrenet(
-    current_x, current_y, current_theta, reference_path);
-
-  // 发布实时横向偏差 d (单位: 米) 到话题 lateral_error
-  std_msgs::msg::Float64 d_msg;
-  d_msg.data = current_frenet.d;
-  lateral_error_pub_->publish(d_msg);
-
   // 从时间参数化轨迹中按时间采样 Frenet 参考状态
   std::vector<double> ref_s(N_, 0.0), ref_v(N_, 0.0);
   std::vector<double> ref_w(N_, 0.0), ref_kappa(N_, 0.0);
@@ -729,13 +750,6 @@ geometry_msgs::msg::TwistStamped MPCController::computeVelocityCommands(
     ref_kappa[k] = ref_points[k].kappa;
     ref_w[k] = ref_v[k] * ref_kappa[k];
   }
-
-  // 4. 计算到最终目标点（Goal Pose）的空间几何关系与剩余弧长
-  double goal_x = transformed_plan.poses.back().pose.position.x;
-  double goal_y = transformed_plan.poses.back().pose.position.y;
-  double goal_yaw = tf2::getYaw(transformed_plan.poses.back().pose.orientation);
-  double dist_to_goal = std::hypot(goal_x - current_x, goal_y - current_y);
-  double s_remain = (reference_path.back().s > current_frenet.s) ? (reference_path.back().s - current_frenet.s) : 0.0;
 
   // 1) 终点切向过冲判定 (Forward Overrun Check)
   double goal_forward_proj = (current_x - goal_x) * std::cos(goal_yaw) + (current_y - goal_y) * std::sin(goal_yaw);

@@ -109,6 +109,82 @@ int main() {
               << (shifted_to_right ? "PASSED (d_max < 0)" : "FAILED") << std::endl;
 
     assert(shifted_to_left && shifted_to_right);
-    std::cout << "\n>>> ALL UNCONSTRAINED CORRIDOR TESTS PASSED! <<<" << std::endl;
+
+    // ========================================================
+    // 6. Test Case 2: 验证障碍物隔断时，严禁构建不可达一侧
+    // 在 x in [1.0, 3.0], y in [-0.15, 0.15] 放置中央隔离障碍物
+    // 机器人位于右侧 (current_d = -0.40) 时，只构建右侧走廊，绝不构建不可达的左侧 [0.15, 0.80]
+    // 机器人位于左侧 (current_d = +0.40) 时，只构建左侧走廊，绝不构建不可达的右侧 [-0.80, -0.15]
+    // ========================================================
+    std::cout << "\n========================================================" << std::endl;
+    std::cout << "Testing Reachability: Do NOT Construct Unreachable Side" << std::endl;
+    std::cout << "========================================================" << std::endl;
+
+    nav2_costmap_2d::Costmap2D split_costmap(100, 100, 0.05, 0.0, -2.5, nav2_costmap_2d::FREE_SPACE);
+    for (unsigned int mx = 0; mx < 100; ++mx) {
+        for (unsigned int my = 0; my < 100; ++my) {
+            double wx, wy;
+            split_costmap.mapToWorld(mx, my, wx, wy);
+            // 中央隔离障碍物: y in [-0.15, 0.15], x in [1.0, 3.0]
+            if (wx >= 1.0 && wx <= 3.0 && wy >= -0.15 && wy <= 0.15) {
+                split_costmap.setCost(mx, my, 253);
+            }
+        }
+    }
+
+    std::vector<TrajectoryPoint> short_traj;
+    s = 0.0;
+    for (double x = 0.0; x <= 4.0; x += 0.1) {
+        TrajectoryPoint p;
+        p.x = x;
+        p.y = 0.0;
+        p.theta = 0.0;
+        p.kappa = 0.0;
+        p.s = s;
+        p.v = 0.5;
+        p.t = s / 0.5;
+        short_traj.push_back(p);
+        s += 0.1;
+    }
+
+    // 6.1 机器人位于右侧 (current_d = -0.40)
+    SafeCorridor corridor_right = generator.generateCorridor(
+        short_traj, &split_costmap, "map", rclcpp::Time(), -1.0, -0.40);
+
+    bool right_case_ok = true;
+    for (const auto & b : corridor_right.bounds) {
+        if (b.x >= 1.2 && b.x <= 2.8) {
+            // 应该只在右侧: d_max <= -0.10, d_min <= -0.70
+            // 绝不能构建左侧 (d_max 绝不能 > 0.10)
+            if (b.d_max > -0.05 || b.d_min > -0.70) {
+                right_case_ok = false;
+                std::cerr << "Right case failed at x=" << b.x << ": d_min=" << b.d_min << ", d_max=" << b.d_max << std::endl;
+            }
+        }
+    }
+    std::cout << "Robot at Right (current_d = -0.40): Only Right constructed: "
+              << (right_case_ok ? "PASSED" : "FAILED") << std::endl;
+    assert(right_case_ok);
+
+    // 6.2 机器人位于左侧 (current_d = +0.40)
+    SafeCorridor corridor_left = generator.generateCorridor(
+        short_traj, &split_costmap, "map", rclcpp::Time(), -1.0, 0.40);
+
+    bool left_case_ok = true;
+    for (const auto & b : corridor_left.bounds) {
+        if (b.x >= 1.2 && b.x <= 2.8) {
+            // 应该只在左侧: d_min >= 0.10, d_max >= 0.70
+            // 绝不能构建右侧 (d_min 绝不能 < -0.10)
+            if (b.d_min < 0.05 || b.d_max < 0.70) {
+                left_case_ok = false;
+                std::cerr << "Left case failed at x=" << b.x << ": d_min=" << b.d_min << ", d_max=" << b.d_max << std::endl;
+            }
+        }
+    }
+    std::cout << "Robot at Left (current_d = +0.40): Only Left constructed: "
+              << (left_case_ok ? "PASSED" : "FAILED") << std::endl;
+    assert(left_case_ok);
+
+    std::cout << "\n>>> ALL UNCONSTRAINED & REACHABLE CORRIDOR TESTS PASSED! <<<" << std::endl;
     return 0;
 }

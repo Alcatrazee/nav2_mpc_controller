@@ -69,6 +69,8 @@ struct SafeCorridorConfig
   bool check_costmap{true};              // Whether to query costmap for obstacle boundaries
   bool avoid_hairpin_self_intersection{true}; // Whether to detect and eliminate U-turn/hairpin corridor self-intersections
   int max_intersection_iters{3};         // Max iterations for non-adjacent self-intersection resolution
+  double goal_approach_dist{0.80};       // Distance to goal where corridor starts funnel snapping [m]
+  double terminal_d_tol{0.05};           // Terminal lateral tolerance at goal [m]
 };
 
 /**
@@ -98,13 +100,17 @@ public:
    * @param costmap Optional pointer to Nav2 Costmap2D for obstacle detection
    * @param frame_id Coordinate frame ID
    * @param stamp Timestamp
+   * @param s_to_goal Distance from current robot position to goal [m]. If negative, no goal approach funnel is applied and corridor stays parallel.
+   * @param current_d Current robot lateral offset in Frenet frame [m]. Used as reachable seed for cross-section 0.
    * @return SafeCorridor The constructed non-self-intersecting safe corridor
    */
   SafeCorridor generateCorridor(
     const std::vector<TrajectoryPoint> & ref_points,
     const nav2_costmap_2d::Costmap2D * costmap = nullptr,
     const std::string & frame_id = "map",
-    const rclcpp::Time & stamp = rclcpp::Time());
+    const rclcpp::Time & stamp = rclcpp::Time(),
+    double s_to_goal = -1.0,
+    double current_d = 0.0);
 
   /**
    * @brief Create comprehensive RViz MarkerArray visualization for the safe corridor
@@ -117,10 +123,11 @@ public:
 private:
   SafeCorridorConfig config_;
 
-  // Step 1: Initialize bounds and perform 2D ray-casting on Costmap
+  // Step 1: Initialize bounds and perform 2D ray-casting on Costmap with reachable connectivity expansion
   void initializeWithCostmap(
     SafeCorridor & corridor,
-    const nav2_costmap_2d::Costmap2D * costmap) const;
+    const nav2_costmap_2d::Costmap2D * costmap,
+    double current_d = 0.0) const;
 
   // Step 2: Apply curvature singularity limitation (1 - kappa * d > 0)
   void applyCurvatureLimit(SafeCorridor & corridor) const;
