@@ -243,10 +243,10 @@ namespace nav2_mpc_controller
     // 4. 利用 Profiler 进行速度与时间参数化
     trajectory_profiler_->generate_profile(dense_points, current_speed);
 
-    // 5. 等 dt 获取 N 步采样点 (已内嵌精确插值)
+    // 5. 获取 N 步采样点 (支持非均匀时间步长，已内嵌精确插值)
     ref_traj.resize(N_);
     for (int k = 0; k < N_; ++k) {
-        double target_time = (k + 1) * dt_;
+        double target_time = (k < static_cast<int>(dt_cumsum_.size())) ? dt_cumsum_[k] : (k + 1) * dt_;
         ref_traj[k] = trajectory_profiler_->get_reference_point(target_time);
     }
 

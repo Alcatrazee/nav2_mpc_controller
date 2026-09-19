@@ -96,7 +96,13 @@ private:
 
   // MPC 参数
   int N_;                // 预测步数
-  double dt_;            // 预测步长 (秒)
+  double dt_;            // 预测基准步长 (秒)
+  bool use_variable_dt_{false}; // 是否启用非均匀时间步长 (默认关闭，使用统一等步长)
+  std::string solver_type_{"osqp"}; // 求解器类型 ("osqp" 或 "ipopt")
+  std::vector<double> dt_vec_;    // 各步离散时间步长
+  std::vector<double> dt_cumsum_; // 累计时间戳
+  void updateDtVectors();
+
   double v_max_;         // 最大线速度
   double v_min_;         // 最小线速度
   double w_max_;         // 最大角速度
@@ -136,6 +142,10 @@ private:
   bool is_cold_start_{true};
   
   double prev_cmd_w_{0.0};
+
+  // 用于存储上一帧的解以供热启动 (Warm Start)
+  casadi::DM prev_sol_u_;
+  casadi::DM prev_sol_x_;
 
   // 用于存储上一帧的 Frenet 状态解
   std::vector<double> prev_s_sol_;
