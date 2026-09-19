@@ -648,6 +648,8 @@ void MPCController::initializeMPC()
     osqp_opts["verbose"] = false;
     casadi::Dict qpsol_opts;
     qpsol_opts["osqp"] = osqp_opts;
+    qpsol_opts["warm_start_primal"] = true;
+    qpsol_opts["warm_start_dual"] = true;
     solver_opts["qpsol_options"] = qpsol_opts;
 
     opti.solver("sqpmethod", solver_opts);
@@ -667,11 +669,12 @@ void MPCController::initializeMPC()
     RCLCPP_INFO(logger_, "Configured MPC with IPOPT solver (~8ms)");
   }
 
-  // 预编译为 C++ Function 计算图
+  // 预编译为 C++ Function 计算图 (传入 U, X 作为初始猜测支持热启动)
   mpc_solver_ = opti.to_function("mpc_solver",
     {X0_param, Ref_s_param, Ref_v_param, Ref_w_param, Ref_kappa_param,
      Corridor_d_min_param, Corridor_d_max_param,
-     Terminal_s_bounds, Terminal_d_bounds, Terminal_epsi_bounds, Terminal_v_bounds},
+     Terminal_s_bounds, Terminal_d_bounds, Terminal_epsi_bounds, Terminal_v_bounds,
+     U, X},
     {U, X});
 
   mpc_problem_initialized_ = true;
@@ -920,7 +923,49 @@ geometry_msgs::msg::TwistStamped MPCController::computeVelocityCommands(
     current_frenet.s, current_frenet.d, current_frenet.e_psi, safe_current_speed};
 
   try {
-    // 直接调用预编译好的 Ipopt Variable-DT Function 函数 (包含时变走廊与终点位姿硬约束)
+    // 构造时移热启动初始猜测 (Shifted Warm Start)
+    casadi::DM u_init = casadi::DM::zeros(2, N_);
+    casadi::DM x_init = casadi::DM::zeros(4, N_ + 1);
+
+    if (is_cold_start_ || prev_sol_u_.is_empty() || prev_sol_x_.is_empty() ||
+        prev_sol_u_.size1() != 2 || prev_sol_u_.size2() != N_ ||
+        prev_sol_x_.size1() != 4 || prev_sol_x_.size2() != N_ + 1)
+    {
+      // 冷启动: 用当前状态与参考轨迹填充初值
+      for (int i = 0; i < 4; ++i) {
+        x_init(i, 0) = current_state[i];
+      }
+      for (int k = 0; k < N_; ++k) {
+        x_init(0, k + 1) = ref_s[k];
+        x_init(1, k + 1) = 0.0;
+        x_init(2, k + 1) = 0.0;
+        x_init(3, k + 1) = ref_v[k];
+      }
+    } else {
+      // 时移热启动 (Shifted Warm Start): 将上一帧最优解向前时移一步
+      // 1) 时移控制量 U: u_init[0..N-2] = prev_u[1..N-1], u_init[N-1] = prev_u[N-1]
+      for (int k = 0; k < N_ - 1; ++k) {
+        u_init(0, k) = prev_sol_u_(0, k + 1);
+        u_init(1, k) = prev_sol_u_(1, k + 1);
+      }
+      u_init(0, N_ - 1) = prev_sol_u_(0, N_ - 1);
+      u_init(1, N_ - 1) = prev_sol_u_(1, N_ - 1);
+
+      // 2) 时移状态量 X: x_init[0] = current_state, x_init[1..N-1] = prev_x[2..N], x_init[N] = prev_x[N]
+      for (int i = 0; i < 4; ++i) {
+        x_init(i, 0) = current_state[i];
+      }
+      for (int k = 1; k < N_; ++k) {
+        for (int i = 0; i < 4; ++i) {
+          x_init(i, k) = prev_sol_x_(i, k + 1);
+        }
+      }
+      for (int i = 0; i < 4; ++i) {
+        x_init(i, N_) = prev_sol_x_(i, N_);
+      }
+    }
+
+    // 调用预编译好的 Function 函数 (包含时变走廊、终点位姿硬约束与热启动初值)
     std::vector<casadi::DM> inputs = {
       casadi::DM(current_state),
       casadi::DM(ref_s),
@@ -932,7 +977,9 @@ geometry_msgs::msg::TwistStamped MPCController::computeVelocityCommands(
       casadi::DM(term_s_bounds),
       casadi::DM(term_d_bounds),
       casadi::DM(term_epsi_bounds),
-      casadi::DM(term_v_bounds)
+      casadi::DM(term_v_bounds),
+      u_init,
+      x_init
     };
     std::vector<casadi::DM> res = mpc_solver_(inputs);
 
