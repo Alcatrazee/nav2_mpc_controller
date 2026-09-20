@@ -766,12 +766,13 @@ geometry_msgs::msg::TwistStamped MPCController::computeVelocityCommands(
   }
 
   // 判定是否为倒车路径 (Reversing Path Detection):
-  // 1) 机器人当前航向角与参考路径起始切线方向偏差 > 90 度
-  // 2) 或局部规划路径起始位姿航向与参考路径起始切线方向偏差 > 90 度
+  // 仅当配置允许倒车 (v_min_ < -0.01) 且航向角与路径起始偏差 > 90 度时，才激活倒车模式；
+  // 若 v_min_ >= 0.0 则为严禁后退的纯前进底盘，绝对不可判定为倒车！
   double heading_to_path = normalize_angle(current_theta - reference_path.front().theta);
   double plan_to_path = (!tracking_plan.poses.empty()) ? 
     normalize_angle(tf2::getYaw(tracking_plan.poses.front().pose.orientation) - reference_path.front().theta) : 0.0;
-  bool is_reversing = (std::abs(heading_to_path) > M_PI_2 || std::abs(plan_to_path) > M_PI_2);
+  bool allow_reversing = (v_min_ < -0.01);
+  bool is_reversing = allow_reversing && (std::abs(heading_to_path) > M_PI_2 || std::abs(plan_to_path) > M_PI_2);
 
   const FrenetState current_frenet = cartesianToFrenet(
     current_x, current_y, current_theta, reference_path, is_reversing);
@@ -1034,17 +1035,21 @@ geometry_msgs::msg::TwistStamped MPCController::computeVelocityCommands(
     if (dist_to_goal > 0.05) {
       double min_creep_v = 0.05; // 5cm/s 保底爬行推进速度，足以克服底盘静摩擦力
       double max_decel = std::max(0.2, std::abs(a_min_));
-      double approach_v_cap = std::clamp(std::sqrt(2.0 * max_decel * dist_to_goal), min_creep_v, v_max_);
+      double v_cap = is_reversing ? std::abs(v_min_) : v_max_;
+      double approach_v_cap = std::clamp(std::sqrt(2.0 * max_decel * dist_to_goal), min_creep_v, v_cap);
       output_v = std::clamp(output_v, min_creep_v, approach_v_cap);
     } else {
       // 已经进入终点 5cm 容差范围内: 立即平稳刹停
       output_v = 0.0;
     }
 
-    double final_v = is_reversing ? -output_v : output_v;
-    double lower_v_limit = is_reversing ? -v_max_ : v_min_;
-    double upper_v_limit = is_reversing ? (v_min_ < 0.0 ? v_min_ : 0.0) : v_max_;
-    cmd_vel.twist.linear.x = std::clamp(final_v, lower_v_limit, upper_v_limit);
+    if (is_reversing) {
+      // 倒车模式：真实倒车限速严格为 [v_min_, 0.0]（例如 [-0.3, 0.0]），严禁使用 -v_max_！
+      cmd_vel.twist.linear.x = std::clamp(-output_v, v_min_, 0.0);
+    } else {
+      // 前进模式：速度严格限制在 [v_min_, v_max_]，若 v_min_ >= 0 则严禁任何后退！
+      cmd_vel.twist.linear.x = std::clamp(output_v, std::max(0.0, v_min_), v_max_);
+    }
     cmd_vel.twist.angular.z = filtered_w;
 
     nav_msgs::msg::Path predict_path;
