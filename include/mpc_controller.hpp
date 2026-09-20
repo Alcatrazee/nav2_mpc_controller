@@ -117,6 +117,7 @@ private:
   double r_v_;
   double r_w_;
   double r_a_;
+  double q_prev_d_{8.0}; // 帧间轨迹一致性惩罚权重 (Inter-sample consistency)
 
   // 动态参数调整
   std::mutex param_mutex_;

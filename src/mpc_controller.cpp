@@ -78,6 +78,8 @@ void MPCController::configure(
   node->get_parameter(plugin_name_ + ".r_v", r_v_);
   node->get_parameter(plugin_name_ + ".r_w", r_w_);
   node->get_parameter(plugin_name_ + ".r_a", r_a_);
+  declare_parameter_if_not_declared(node, plugin_name_ + ".q_prev_d", rclcpp::ParameterValue(8.0));
+  node->get_parameter(plugin_name_ + ".q_prev_d", q_prev_d_);
 
   node->get_parameter(plugin_name_ + ".corridor_default_left_width", corridor_config_.default_left_width);
   node->get_parameter(plugin_name_ + ".corridor_default_right_width", corridor_config_.default_right_width);
@@ -289,6 +291,8 @@ rcl_interfaces::msg::SetParametersResult MPCController::dynamicParametersCallbac
       r_w_ = parameter.as_double();
     } else if (name == plugin_name_ + ".r_a") {
       r_a_ = parameter.as_double();
+    } else if (name == plugin_name_ + ".q_prev_d") {
+      q_prev_d_ = parameter.as_double();
     } else if (name == plugin_name_ + ".corridor_default_left_width") {
       corridor_config_.default_left_width = parameter.as_double();
       update_corridor = true;
@@ -532,6 +536,7 @@ void MPCController::initializeMPC()
   auto Ref_kappa_param = opti.parameter(N_);
   auto Corridor_d_min_param = opti.parameter(N_);
   auto Corridor_d_max_param = opti.parameter(N_);
+  auto Prev_d_param = opti.parameter(N_);
 
   // 初始状态约束 (X0 = current_state)
   opti.subject_to(X(0, 0) == X0_param(0));
@@ -602,6 +607,7 @@ void MPCController::initializeMPC()
     cost += q_d_ * pow(X(1, k+1), 2);                  // 开阔区跟踪平滑全局参考线
     cost += q_corridor_center_ * centering_cost;      // 窄通道强力自适应居中！
     cost += q_corridor_bound_ * barrier_cost;         // 边缘防碰撞排斥屏障
+    cost += q_prev_d_ * pow(X(1, k+1) - Prev_d_param(k), 2); // 帧间轨迹一致性惩罚，抑制微抖与跳跃！
     cost += q_e_psi_ * pow(X(2, k+1), 2);
     cost += r_v_ * pow(X(3, k+1) - Ref_v_param(k), 2);
     cost += r_w_ * pow(U(1, k) - Ref_w_param(k), 2);
@@ -672,7 +678,7 @@ void MPCController::initializeMPC()
   // 预编译为 C++ Function 计算图 (传入 U, X 作为初始猜测支持热启动)
   mpc_solver_ = opti.to_function("mpc_solver",
     {X0_param, Ref_s_param, Ref_v_param, Ref_w_param, Ref_kappa_param,
-     Corridor_d_min_param, Corridor_d_max_param,
+     Corridor_d_min_param, Corridor_d_max_param, Prev_d_param,
      Terminal_s_bounds, Terminal_d_bounds, Terminal_epsi_bounds, Terminal_v_bounds,
      U, X},
     {U, X});
@@ -791,13 +797,22 @@ geometry_msgs::msg::TwistStamped MPCController::computeVelocityCommands(
   std::vector<double> corridor_d_min(N_, -corridor_config_.default_right_width);
   std::vector<double> corridor_d_max(N_,  corridor_config_.default_left_width);
 
+  // 提取时移上一轮规划轨迹 (Shifted Previous Planned Lateral Trajectory)
+  std::vector<double> prev_d(N_, 0.0);
+  if (!is_cold_start_ && !prev_sol_x_.is_empty() && prev_sol_x_.size2() == N_ + 1) {
+    for (int k = 0; k < N_ - 1; ++k) {
+      prev_d[k] = double(prev_sol_x_(1, k + 1));
+    }
+    prev_d[N_ - 1] = double(prev_sol_x_(1, N_));
+  }
+
   if (enable_safe_corridor_) {
-    // 1. 构建基于参考路线的安全走廊 (结合障碍物、曲率半径限制与掉头弯防自交叉)
+    // 1. 构建基于参考路线的安全走廊 (结合障碍物、曲率半径限制、掉头弯防自交叉与上一轮规划轨迹引导)
     // 传入到终点的剩余弧长 s_remain：未到终点时保持两边平行状态，接近终点最后进近阶段漏斗收拢
-    // 传入当前横向偏差 current_frenet.d：基于机器人当前位姿与连通性进行可达性扩散，不构建不可达一侧
+    // 传入当前横向偏差 current_frenet.d 与上一轮规划横向点 prev_d：基于历史意图与连通性进行可达性扩散
     auto * costmap = (costmap_ros_ && corridor_config_.check_costmap) ? costmap_ros_->getCostmap() : nullptr;
     current_safe_corridor_ = safe_corridor_generator_->generateCorridor(
-      ref_points, costmap, pose.header.frame_id, cmd_vel.header.stamp, s_remain, current_frenet.d);
+      ref_points, costmap, pose.header.frame_id, cmd_vel.header.stamp, s_remain, current_frenet.d, prev_d);
 
     // 发布安全走廊 3D 网格、边界及截面肋线可视化 MarkerArray
     if (safe_corridor_marker_pub_ && safe_corridor_marker_pub_->is_activated()) {
@@ -974,6 +989,7 @@ geometry_msgs::msg::TwistStamped MPCController::computeVelocityCommands(
       casadi::DM(ref_kappa),
       casadi::DM(corridor_d_min),
       casadi::DM(corridor_d_max),
+      casadi::DM(prev_d),
       casadi::DM(term_s_bounds),
       casadi::DM(term_d_bounds),
       casadi::DM(term_epsi_bounds),

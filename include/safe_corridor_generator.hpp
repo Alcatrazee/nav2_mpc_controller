@@ -102,6 +102,7 @@ public:
    * @param stamp Timestamp
    * @param s_to_goal Distance from current robot position to goal [m]. If negative, no goal approach funnel is applied and corridor stays parallel.
    * @param current_d Current robot lateral offset in Frenet frame [m]. Used as reachable seed for cross-section 0.
+   * @param prev_planned_d Optional previous planned lateral trajectory for temporal consistency guidance.
    * @return SafeCorridor The constructed non-self-intersecting safe corridor
    */
   SafeCorridor generateCorridor(
@@ -110,7 +111,8 @@ public:
     const std::string & frame_id = "map",
     const rclcpp::Time & stamp = rclcpp::Time(),
     double s_to_goal = -1.0,
-    double current_d = 0.0);
+    double current_d = 0.0,
+    const std::vector<double> & prev_planned_d = {});
 
   /**
    * @brief Create comprehensive RViz MarkerArray visualization for the safe corridor
@@ -127,7 +129,8 @@ private:
   void initializeWithCostmap(
     SafeCorridor & corridor,
     const nav2_costmap_2d::Costmap2D * costmap,
-    double current_d = 0.0) const;
+    double current_d = 0.0,
+    const std::vector<double> & prev_planned_d = {}) const;
 
   // Step 2: Apply curvature singularity limitation (1 - kappa * d > 0)
   void applyCurvatureLimit(SafeCorridor & corridor) const;

@@ -185,6 +185,77 @@ int main() {
               << (left_case_ok ? "PASSED" : "FAILED") << std::endl;
     assert(left_case_ok);
 
-    std::cout << "\n>>> ALL UNCONSTRAINED & REACHABLE CORRIDOR TESTS PASSED! <<<" << std::endl;
+    // ========================================================
+    // 7. Test Case 3: 严格测试绕行防左右横跳 (Anti-Oscillation Test)
+    // 障碍物挡在中路偏左: y in [-0.10, 0.20], x in [1.0, 3.0]
+    // 左侧通路: y in [0.20, 0.65] (宽度 0.45m)
+    // 右侧通路: y in [-0.80, -0.10] (宽度 0.70m, 明显比左侧宽 25cm!)
+    // 当机身在左侧 (current_d = +0.35m) 绕行时，走廊必须严格锁定左侧，绝不能因右侧更宽而跳到右侧！
+    // ========================================================
+    std::cout << "\n========================================================" << std::endl;
+    std::cout << "Testing Anti-Oscillation: Wider Opposite Side Does NOT Trigger Switching" << std::endl;
+    std::cout << "========================================================" << std::endl;
+
+    nav2_costmap_2d::Costmap2D asym_costmap(100, 100, 0.05, 0.0, -2.5, nav2_costmap_2d::FREE_SPACE);
+    for (unsigned int mx = 0; mx < 100; ++mx) {
+        for (unsigned int my = 0; my < 100; ++my) {
+            double wx, wy;
+            asym_costmap.mapToWorld(mx, my, wx, wy);
+            // 障碍物占据 y in [-0.10, 0.20]
+            if (wx >= 1.0 && wx <= 3.0 && wy >= -0.10 && wy <= 0.20) {
+                asym_costmap.setCost(mx, my, 253);
+            }
+        }
+    }
+
+    // 机器人位于左侧 (current_d = +0.35)
+    SafeCorridor corridor_asym_left = generator.generateCorridor(
+        short_traj, &asym_costmap, "map", rclcpp::Time(), -1.0, 0.35);
+
+    bool anti_oscillation_ok = true;
+    for (const auto & b : corridor_asym_left.bounds) {
+        if (b.x >= 1.2 && b.x <= 2.8) {
+            // 必须严格在左侧: d_min >= 0.05, d_max >= 0.60
+            // 绝不能跳跃到更宽的右侧 (d_min 绝不能为负值)
+            if (b.d_min < 0.05) {
+                anti_oscillation_ok = false;
+                std::cerr << "Anti-oscillation failed at x=" << b.x 
+                          << ": Jumped to right side! d_min=" << b.d_min << ", d_max=" << b.d_max << std::endl;
+            }
+        }
+    }
+    std::cout << "Anti-Oscillation Check (Robot at Left, Right is wider): "
+              << (anti_oscillation_ok ? "PASSED (Strictly Kept Left)" : "FAILED (Jumped to Right)") << std::endl;
+    assert(anti_oscillation_ok);
+
+    // ========================================================
+    // 8. Test Case 4: 验证上一轮规划点引导走廊 (prev_planned_d Guidance)
+    // 机器人当前位于中线 (current_d = 0.0)
+    // 但上一轮 MPC 规划的轨迹点序列在左侧 (prev_planned_d = +0.35m)
+    // 走廊必须继承上一轮意图，沿左侧展开 (d_min >= 0.05)，绝不跳跃
+    // ========================================================
+    std::cout << "\n========================================================" << std::endl;
+    std::cout << "Testing Temporal Guidance: prev_planned_d Guides Corridor" << std::endl;
+    std::cout << "========================================================" << std::endl;
+
+    std::vector<double> prev_planned_d(short_traj.size(), 0.35);
+    SafeCorridor corridor_guided = generator.generateCorridor(
+        short_traj, &asym_costmap, "map", rclcpp::Time(), -1.0, 0.0, prev_planned_d);
+
+    bool guidance_ok = true;
+    for (const auto & b : corridor_guided.bounds) {
+        if (b.x >= 1.2 && b.x <= 2.8) {
+            if (b.d_min < 0.05) {
+                guidance_ok = false;
+                std::cerr << "Guidance failed at x=" << b.x 
+                          << ": Did not follow prev_planned_d to left! d_min=" << b.d_min << std::endl;
+            }
+        }
+    }
+    std::cout << "Temporal Guidance Check (current_d=0, prev_planned_d=+0.35): "
+              << (guidance_ok ? "PASSED (Followed Previous Plan Left)" : "FAILED") << std::endl;
+    assert(guidance_ok);
+
+    std::cout << "\n>>> ALL UNCONSTRAINED, REACHABLE, ANTI-OSCILLATION & TEMPORAL GUIDANCE TESTS PASSED! <<<" << std::endl;
     return 0;
 }

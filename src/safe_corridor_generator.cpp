@@ -72,7 +72,8 @@ bool SafeCorridorGenerator::computeLineSegmentIntersection(
 void SafeCorridorGenerator::initializeWithCostmap(
   SafeCorridor & corridor,
   const nav2_costmap_2d::Costmap2D * costmap,
-  double current_d) const
+  double current_d,
+  const std::vector<double> & prev_planned_d) const
 {
   if (corridor.bounds.empty()) {
     return;
@@ -128,6 +129,31 @@ void SafeCorridorGenerator::initializeWithCostmap(
     return {d_min, d_max};
   };
 
+  // 拓扑分支状态：记录当前走廊所锁定的绕障分支侧 (UNKNOWN: 居中无偏好; LEFT: 锁定左侧; RIGHT: 锁定右侧)
+  enum class BranchSide { UNKNOWN, LEFT, RIGHT };
+  BranchSide active_branch = BranchSide::UNKNOWN;
+
+  // 1. 优先根据上一轮规划轨迹判断已存在的绕障意图 (Temporal Branch Inheritance)
+  if (!prev_planned_d.empty()) {
+    double max_d = *std::max_element(prev_planned_d.begin(), prev_planned_d.end());
+    double min_d = *std::min_element(prev_planned_d.begin(), prev_planned_d.end());
+    if (max_d > 0.12 && std::abs(min_d) < max_d) {
+      active_branch = BranchSide::LEFT;
+    } else if (min_d < -0.12 && std::abs(max_d) < std::abs(min_d)) {
+      active_branch = BranchSide::RIGHT;
+    }
+  }
+
+  // 2. 若上一轮规划无明确偏好，根据机器人当前横向偏差初始化分支偏好
+  if (active_branch == BranchSide::UNKNOWN) {
+    if (current_d > 0.05) {
+      active_branch = BranchSide::LEFT;
+    } else if (current_d < -0.05) {
+      active_branch = BranchSide::RIGHT;
+    }
+  }
+
+  bool has_avoided_obstacle = false;
   double prev_min = -config_.default_right_width;
   double prev_max = config_.default_left_width;
   double prev_center = std::clamp(current_d, -config_.default_right_width, config_.default_left_width);
@@ -136,13 +162,13 @@ void SafeCorridorGenerator::initializeWithCostmap(
     auto & bound = corridor.bounds[i];
 
     if (i == 0) {
-      // 截面 0：基于机器人当前横向偏差 current_d 进行可达性扩散
+      // 截面 0：从机身当前匹配的点位 target_seed 开始进行连通空间构建
       double target_seed = std::clamp(current_d, -config_.default_right_width, config_.default_left_width);
       bool seed_found = false;
 
       if (is_free(bound, target_seed)) {
         auto interval = expand_from_seed(bound, target_seed);
-        if (interval.second - interval.first >= 0.10) {
+        if (interval.second - interval.first >= config_.min_corridor_width) {
           bound.d_min = interval.first;
           bound.d_max = interval.second;
           seed_found = true;
@@ -150,61 +176,92 @@ void SafeCorridorGenerator::initializeWithCostmap(
       }
 
       if (!seed_found) {
-        // 若机器人当前位置落于障碍物或膨胀层内，沿截面向两侧就近搜索连通自由种子
-        double min_dist = 1e9;
-        std::pair<double, double> best_interval{-0.05, 0.05};
+        // 若机器人当前位置落于障碍物或膨胀层内，从 target_seed 沿截面向两侧就近搜索首个自由种子
+        for (double offset = step_size; offset <= config_.default_left_width + config_.default_right_width; offset += step_size) {
+          double d1 = (active_branch == BranchSide::RIGHT) ? (target_seed - offset) : (target_seed + offset);
+          double d2 = (active_branch == BranchSide::RIGHT) ? (target_seed + offset) : (target_seed - offset);
 
-        for (double d = -config_.default_right_width; d <= config_.default_left_width + 1e-4; d += step_size) {
-          if (is_free(bound, d)) {
-            auto interval = expand_from_seed(bound, d);
-            double width = interval.second - interval.first;
-            if (width >= 0.10) {
-              double dist = std::abs(d - target_seed);
-              if (dist < min_dist) {
-                min_dist = dist;
-                best_interval = interval;
-                seed_found = true;
-              }
+          if (d1 >= -config_.default_right_width && d1 <= config_.default_left_width && is_free(bound, d1)) {
+            auto interval = expand_from_seed(bound, d1);
+            if (interval.second - interval.first >= config_.min_corridor_width) {
+              bound.d_min = interval.first;
+              bound.d_max = interval.second;
+              seed_found = true;
+              break;
+            }
+          }
+          if (d2 >= -config_.default_right_width && d2 <= config_.default_left_width && is_free(bound, d2)) {
+            auto interval = expand_from_seed(bound, d2);
+            if (interval.second - interval.first >= config_.min_corridor_width) {
+              bound.d_min = interval.first;
+              bound.d_max = interval.second;
+              seed_found = true;
+              break;
             }
           }
         }
 
-        if (seed_found) {
-          bound.d_min = best_interval.first;
-          bound.d_max = best_interval.second;
-        } else {
-          // 整个截面均无有效通行空间
+        if (!seed_found) {
+          // 整个截面均无有效通行空间，维持 target_seed 附近的窄带容错
           bound.d_min = std::clamp(target_seed - 0.05, -config_.default_right_width, config_.default_left_width);
           bound.d_max = std::clamp(target_seed + 0.05, -config_.default_right_width, config_.default_left_width);
         }
       }
+
+      // 如果截面 0 已处于单侧避障收缩状态，锁定分支
+      if (bound.d_min > 0.02) {
+        active_branch = BranchSide::LEFT;
+        has_avoided_obstacle = true;
+      } else if (bound.d_max < -0.02) {
+        active_branch = BranchSide::RIGHT;
+        has_avoided_obstacle = true;
+      }
     } else {
-      // 截面 i > 0：基于上一截面的有效走廊保持空间连通性
+      // 截面 i > 0：沿着与上一截面物理连通的方向严格单侧延伸，直至截取路线的最远处
       double ds = std::max(0.01, bound.s - corridor.bounds[i - 1].s);
       double reach_margin = config_.max_lateral_rate * ds + step_size;
       double search_min = std::max(-config_.default_right_width, prev_min - reach_margin);
       double search_max = std::min(config_.default_left_width, prev_max + reach_margin);
 
-      // 优先测试上一截面走廊中心在当前截面的连通性
       bool resolved = false;
-      if (is_free(bound, prev_center)) {
-        auto interval = expand_from_seed(bound, prev_center);
-        if (interval.second - interval.first >= 0.10) {
-          bound.d_min = interval.first;
-          bound.d_max = interval.second;
-          resolved = true;
+
+      // 1. 优先测试上一轮规划点在当前截面的连通性 (Temporal Seed Expansion)
+      if (i < prev_planned_d.size()) {
+        double plan_seed = std::clamp(prev_planned_d[i], -config_.default_right_width, config_.default_left_width);
+        if (is_free(bound, plan_seed)) {
+          auto interval = expand_from_seed(bound, plan_seed);
+          if (interval.second - interval.first >= config_.min_corridor_width) {
+            if (interval.second >= search_min && interval.first <= search_max) {
+              bound.d_min = interval.first;
+              bound.d_max = interval.second;
+              resolved = true;
+            }
+          }
         }
       }
 
+      // 2. 若上一轮规划点受阻或未提供，测试上一截面中心在当前截面的连通性 (Spatial Continuity)
+      if (!resolved && is_free(bound, prev_center)) {
+        auto interval = expand_from_seed(bound, prev_center);
+        if (interval.second - interval.first >= config_.min_corridor_width) {
+          // 检查此区间是否与上一截面走廊物理重叠连通
+          if (interval.second >= search_min && interval.first <= search_max) {
+            bound.d_min = interval.first;
+            bound.d_max = interval.second;
+            resolved = true;
+          }
+        }
+      }
+
+      // 3. 若上一截面中心与上一轮规划点均受阻，在已锁定的单侧分支内搜索延伸
       if (!resolved) {
-        // 上一截面中心在当前截面被障碍物阻断：分别在左侧和右侧就近搜索连通种子
-        // 阻断跨越障碍物的区间，严禁跳跃到障碍物隔断的不可达一侧
+        // 分别在左侧和右侧搜索自由连通区间
         bool found_left = false;
         std::pair<double, double> left_interval;
-        for (double d = prev_center + step_size; d <= search_max + 1e-4; d += step_size) {
+        for (double d = std::max(-config_.default_right_width, prev_center + step_size); d <= config_.default_left_width + 1e-4; d += step_size) {
           if (is_free(bound, d)) {
             left_interval = expand_from_seed(bound, d);
-            if (left_interval.second - left_interval.first >= 0.10) {
+            if (left_interval.second - left_interval.first >= config_.min_corridor_width) {
               found_left = true;
               break;
             }
@@ -213,10 +270,10 @@ void SafeCorridorGenerator::initializeWithCostmap(
 
         bool found_right = false;
         std::pair<double, double> right_interval;
-        for (double d = prev_center - step_size; d >= search_min - 1e-4; d -= step_size) {
+        for (double d = std::min(config_.default_left_width, prev_center - step_size); d >= -config_.default_right_width - 1e-4; d -= step_size) {
           if (is_free(bound, d)) {
             right_interval = expand_from_seed(bound, d);
-            if (right_interval.second - right_interval.first >= 0.10) {
+            if (right_interval.second - right_interval.first >= config_.min_corridor_width) {
               found_right = true;
               break;
             }
@@ -224,37 +281,82 @@ void SafeCorridorGenerator::initializeWithCostmap(
         }
 
         if (found_left && found_right) {
-          double width_left = left_interval.second - left_interval.first;
-          double width_right = right_interval.second - right_interval.first;
-          if (width_left > width_right + 0.10) {
+          // 关键决断：两侧均有通行空间时，严禁因宽度比较而左右横跳！
+          // 严格根据已锁定的分支方向 (active_branch) 或当前机器人位置选择
+          if (active_branch == BranchSide::LEFT) {
             bound.d_min = left_interval.first;
             bound.d_max = left_interval.second;
-          } else if (width_right > width_left + 0.10) {
+          } else if (active_branch == BranchSide::RIGHT) {
             bound.d_min = right_interval.first;
             bound.d_max = right_interval.second;
           } else {
-            // 宽度相当时，偏向当前位姿/上一截面中心更近的可达一侧
-            double center_left = 0.5 * (left_interval.first + left_interval.second);
-            double center_right = 0.5 * (right_interval.first + right_interval.second);
-            if (std::abs(center_left - current_d) <= std::abs(center_right - current_d)) {
+            // active_branch 为 UNKNOWN（首次分叉点）
+            if (current_d > 0.02) {
               bound.d_min = left_interval.first;
               bound.d_max = left_interval.second;
-            } else {
+              active_branch = BranchSide::LEFT;
+            } else if (current_d < -0.02) {
               bound.d_min = right_interval.first;
               bound.d_max = right_interval.second;
+              active_branch = BranchSide::RIGHT;
+            } else {
+              // 处于中线且无偏好时，选择更宽的一侧，并立即锁定该分支侧
+              double width_left = left_interval.second - left_interval.first;
+              double width_right = right_interval.second - right_interval.first;
+              if (width_left >= width_right) {
+                bound.d_min = left_interval.first;
+                bound.d_max = left_interval.second;
+                active_branch = BranchSide::LEFT;
+              } else {
+                bound.d_min = right_interval.first;
+                bound.d_max = right_interval.second;
+                active_branch = BranchSide::RIGHT;
+              }
             }
           }
+          resolved = true;
         } else if (found_left) {
-          bound.d_min = left_interval.first;
-          bound.d_max = left_interval.second;
+          // 仅左侧连通：
+          if (active_branch == BranchSide::RIGHT) {
+            // 右侧受阻，保持上一截面中心窄带，严禁跨越障碍物
+            bound.d_min = std::clamp(prev_center - 0.05, -config_.default_right_width, config_.default_left_width);
+            bound.d_max = std::clamp(prev_center + 0.05, -config_.default_right_width, config_.default_left_width);
+          } else {
+            bound.d_min = left_interval.first;
+            bound.d_max = left_interval.second;
+            if (active_branch == BranchSide::UNKNOWN) {
+              active_branch = BranchSide::LEFT;
+            }
+          }
+          resolved = true;
         } else if (found_right) {
-          bound.d_min = right_interval.first;
-          bound.d_max = right_interval.second;
+          // 仅右侧连通：
+          if (active_branch == BranchSide::LEFT) {
+            // 左侧受阻，保持上一截面中心窄带，严禁跨越障碍物
+            bound.d_min = std::clamp(prev_center - 0.05, -config_.default_right_width, config_.default_left_width);
+            bound.d_max = std::clamp(prev_center + 0.05, -config_.default_right_width, config_.default_left_width);
+          } else {
+            bound.d_min = right_interval.first;
+            bound.d_max = right_interval.second;
+            if (active_branch == BranchSide::UNKNOWN) {
+              active_branch = BranchSide::RIGHT;
+            }
+          }
+          resolved = true;
         } else {
-          // 当前截面可达范围内被完全阻断：维持上一截面中心的窄带，不跨越障碍物去构建不可达区域
+          // 当前截面可达范围内被完全阻断：维持上一截面中心的窄带，严禁跨越障碍物
           bound.d_min = std::clamp(prev_center - 0.05, -config_.default_right_width, config_.default_left_width);
           bound.d_max = std::clamp(prev_center + 0.05, -config_.default_right_width, config_.default_left_width);
         }
+      }
+
+      // 3. 记录避障收缩状态与绕障完成检测
+      if (bound.d_min > 0.02 || bound.d_max < -0.02) {
+        has_avoided_obstacle = true;
+      } else if (has_avoided_obstacle && bound.d_min <= -0.15 && bound.d_max >= 0.15) {
+        // 障碍物已结束，走廊已重新包络参考中心线，重置分支状态
+        active_branch = BranchSide::UNKNOWN;
+        has_avoided_obstacle = false;
       }
     }
 
@@ -500,7 +602,8 @@ SafeCorridor SafeCorridorGenerator::generateCorridor(
   const std::string & frame_id,
   const rclcpp::Time & stamp,
   double s_to_goal,
-  double current_d)
+  double current_d,
+  const std::vector<double> & prev_planned_d)
 {
   SafeCorridor corridor;
   corridor.frame_id = frame_id;
@@ -523,8 +626,8 @@ SafeCorridor SafeCorridorGenerator::generateCorridor(
     bound.t = pt.t;
   }
 
-  // 1. Initial raycasting against costmap obstacles with reachable connectivity expansion
-  initializeWithCostmap(corridor, costmap, current_d);
+  // 1. Initial raycasting against costmap obstacles with reachable connectivity expansion & temporal guidance
+  initializeWithCostmap(corridor, costmap, current_d, prev_planned_d);
 
   // 2. Prevent curvature center singularity (1 - kappa * d > 0)
   applyCurvatureLimit(corridor);
